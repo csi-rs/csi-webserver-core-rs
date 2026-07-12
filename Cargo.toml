@@ -1,0 +1,31 @@
+[package]
+name = "csi-webserver-core"
+version = "0.1.0"
+edition = "2024"
+description = "Embeddable HTTP/WebSocket library for streaming ESP32 CSI data over USB serial"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/csi-rs/csi-webserver-core-rs"
+documentation = "https://docs.rs/csi-webserver-core"
+keywords = ["esp32", "csi", "websocket", "serial", "axum"]
+categories = ["web-programming::http-server", "network-programming", "api-bindings"]
+rust-version = "1.85"
+include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
+authors = ["stacks-of-data", "theembeddedrustacean"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+axum = { version = "0.8.8", features = ["ws"] }
+tokio = { version = "1.50.0", features = ["full"] }
+tokio-serial = "5.4.5"
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["clock"] }
+postcard = { version = "1", features = ["use-std"] }
+arrow = "59"
+parquet = { version = "59", features = ["arrow"] }
