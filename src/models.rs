@@ -306,19 +306,34 @@ pub struct WifiConfig {
     /// Forced ESP-NOW TX HT40 secondary channel: `above` | `below` |
     /// `none` | `off`. ESP-NOW modes only.
     pub ht40: Option<String>,
+    /// Parameters the core does not name are carried verbatim here and
+    /// re-emitted generically as `--{key}={value}` (same convention as
+    /// [`CsiConfig::extra`]). This lets an embedder's [`CsiProfile`] accept
+    /// modes (see [`CsiProfile::extra_wifi_modes`]) that need flags the open
+    /// core does not know — without the core naming any of them.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl WifiConfig {
     /// Validate values and emit the matching `set-wifi …` line.
     ///
     /// `chip` is used to pick the firmware default channel when `channel` is
-    /// omitted for non-`station` modes (C5 → 149, C6 → 6).
-    pub fn to_cli_command(&self, chip: Option<&str>) -> Result<String, String> {
-        if !WIFI_MODES.contains(&self.mode.as_str()) {
+    /// omitted for non-`station` modes (C5 → 149, C6 → 6). `profile` supplies
+    /// any extra `--mode` values the open core does not name.
+    pub fn to_cli_command(
+        &self,
+        chip: Option<&str>,
+        profile: &dyn CsiProfile,
+    ) -> Result<String, String> {
+        let extra_modes = profile.extra_wifi_modes();
+        if !WIFI_MODES.contains(&self.mode.as_str()) && !extra_modes.contains(&self.mode.as_str()) {
+            let mut accepted: Vec<&str> = WIFI_MODES.to_vec();
+            accepted.extend_from_slice(extra_modes);
             return Err(format!(
                 "Unknown wifi mode '{}'; expected one of: {}",
                 self.mode,
-                WIFI_MODES.join(", ")
+                accepted.join(", ")
             ));
         }
 
@@ -417,6 +432,12 @@ impl WifiConfig {
                 }
             }
             cmd.push_str(&format!(" --ht40={ht40}"));
+        }
+
+        // Profile-supplied / unknown params (e.g. an injector's inter-frame
+        // period) ride in `extra` and re-emit generically as `--{key}={value}`.
+        for (key, value) in &self.extra {
+            push_extra(&mut cmd, key, value);
         }
 
         Ok(cmd)
@@ -870,13 +891,14 @@ mod tests {
             channel: None,
             peer_mac: peer_mac.map(str::to_string),
             ht40: ht40.map(str::to_string),
+            extra: BTreeMap::new(),
         }
     }
 
     #[test]
     fn wifi_emits_peer_mac_and_ht40() {
         let cmd = wifi("esp-now-central", Some("AA:BB:CC:DD:EE:FF"), Some("above"))
-            .to_cli_command(None)
+            .to_cli_command(None, &StandardCsiProfile)
             .unwrap();
         assert_eq!(
             cmd,
@@ -887,22 +909,38 @@ mod tests {
     #[test]
     fn wifi_empty_peer_mac_clears_to_auto() {
         let cmd = wifi("esp-now-peripheral", Some(""), None)
-            .to_cli_command(None)
+            .to_cli_command(None, &StandardCsiProfile)
             .unwrap();
         assert_eq!(cmd, "set-wifi --mode=esp-now-peripheral --set-channel=1 --peer-mac=");
     }
 
     #[test]
+    fn wifi_extra_forwards_hop_params_verbatim() {
+        // Channel-hopping flags (--hop-list / --hop-channel / --hop-burst /
+        // --hop-follow-ms) are HE20-node keys the open core does not name; they
+        // ride through `extra` and must re-emit unquoted — the CSV hop list in
+        // particular must survive as `1,5,9,13`, not `"1,5,9,13"`.
+        let mut cfg = wifi("esp-now-central", None, None);
+        cfg.extra
+            .insert("hop-list".to_string(), serde_json::json!("1,5,9,13"));
+        cfg.extra
+            .insert("hop-follow-ms".to_string(), serde_json::json!(75));
+        let cmd = cfg.to_cli_command(None, &StandardCsiProfile).unwrap();
+        assert!(cmd.contains("--hop-list=1,5,9,13"), "{cmd}");
+        assert!(cmd.contains("--hop-follow-ms=75"), "{cmd}");
+    }
+
+    #[test]
     fn wifi_rejects_malformed_peer_mac() {
         assert!(wifi("esp-now-central", Some("not-a-mac"), None)
-            .to_cli_command(None)
+            .to_cli_command(None, &StandardCsiProfile)
             .is_err());
     }
 
     #[test]
     fn wifi_rejects_bad_ht40() {
         assert!(wifi("esp-now-central", None, Some("sideways"))
-            .to_cli_command(None)
+            .to_cli_command(None, &StandardCsiProfile)
             .is_err());
     }
 
@@ -922,8 +960,9 @@ mod tests {
             channel: Some(6),
             peer_mac: None,
             ht40: None,
+            extra: BTreeMap::new(),
         }
-        .to_cli_command(None)
+        .to_cli_command(None, &StandardCsiProfile)
         .unwrap();
         assert_eq!(
             cmd,
@@ -948,8 +987,9 @@ mod tests {
             channel: None,
             peer_mac: None,
             ht40: None,
+            extra: BTreeMap::new(),
         }
-        .to_cli_command(Some("esp32c5"))
+        .to_cli_command(Some("esp32c5"), &StandardCsiProfile)
         .unwrap();
         assert_eq!(cmd, "set-wifi --mode=station --sta-ssid='MyNetwork'");
     }
@@ -968,8 +1008,9 @@ mod tests {
             channel: None,
             peer_mac: None,
             ht40: None,
+            extra: BTreeMap::new(),
         }
-        .to_cli_command(Some("esp32c5"))
+        .to_cli_command(Some("esp32c5"), &StandardCsiProfile)
         .unwrap();
         assert_eq!(
             cmd,
@@ -991,8 +1032,9 @@ mod tests {
             channel: Some(6),
             peer_mac: None,
             ht40: None,
+            extra: BTreeMap::new(),
         }
-        .to_cli_command(None)
+        .to_cli_command(None, &StandardCsiProfile)
         .unwrap();
         assert_eq!(
             cmd,
@@ -1014,8 +1056,9 @@ mod tests {
             channel: Some(6),
             peer_mac: None,
             ht40: None,
+            extra: BTreeMap::new(),
         }
-        .to_cli_command(None)
+        .to_cli_command(None, &StandardCsiProfile)
         .unwrap();
         assert_eq!(
             cmd,
@@ -1027,7 +1070,7 @@ mod tests {
     fn wifi_ap_burst_off_emits_off() {
         let mut cfg = wifi("wifi-ap", None, None);
         cfg.ap_burst = Some(false);
-        let cmd = cfg.to_cli_command(None).unwrap();
+        let cmd = cfg.to_cli_command(None, &StandardCsiProfile).unwrap();
         assert_eq!(cmd, "set-wifi --mode=wifi-ap --ap-burst=off --set-channel=1");
     }
 
@@ -1036,14 +1079,14 @@ mod tests {
         for bad in [0u8, 9] {
             let mut cfg = wifi("wifi-ap", None, None);
             cfg.ap_leases = Some(bad);
-            assert!(cfg.to_cli_command(None).is_err());
+            assert!(cfg.to_cli_command(None, &StandardCsiProfile).is_err());
         }
     }
 
     #[test]
     fn wifi_fast_collector_emits_peer_mac_and_ht40() {
         let cmd = wifi("esp-now-fast-collector", Some("aa:bb:cc:dd:ee:ff"), Some("below"))
-            .to_cli_command(None)
+            .to_cli_command(None, &StandardCsiProfile)
             .unwrap();
         assert_eq!(
             cmd,
@@ -1053,7 +1096,33 @@ mod tests {
 
     #[test]
     fn wifi_rejects_unknown_mode() {
-        assert!(wifi("mesh", None, None).to_cli_command(None).is_err());
+        assert!(wifi("mesh", None, None).to_cli_command(None, &StandardCsiProfile).is_err());
+    }
+
+    /// A profile that names an extra wifi mode, standing in for an out-of-tree
+    /// capability crate. The open core must accept the mode and re-emit any
+    /// unknown `extra` params generically, without naming either itself.
+    struct ExtraModeProfile;
+    impl CsiProfile for ExtraModeProfile {
+        fn extra_wifi_modes(&self) -> &'static [&'static str] {
+            &["custom-mode"]
+        }
+    }
+
+    #[test]
+    fn wifi_accepts_profile_mode_and_emits_extra_params() {
+        let mut cfg = wifi("custom-mode", None, None);
+        cfg.extra
+            .insert("inject-period-ms".to_string(), serde_json::json!(20));
+        let cmd = cfg.to_cli_command(None, &ExtraModeProfile).unwrap();
+        assert_eq!(
+            cmd,
+            "set-wifi --mode=custom-mode --set-channel=1 --inject-period-ms=20"
+        );
+        // The standard (no-op) profile does not name the mode, so it is rejected.
+        assert!(wifi("custom-mode", None, None)
+            .to_cli_command(None, &StandardCsiProfile)
+            .is_err());
     }
 
     /// A `CsiConfig` with every named flag unset and an empty `extra` map.
