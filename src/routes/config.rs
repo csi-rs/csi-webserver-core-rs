@@ -39,7 +39,7 @@ pub async fn set_wifi(
     Json(body): Json<WifiConfig>,
 ) -> (StatusCode, Json<ApiResponse>) {
     let chip = device_chip(&dev).await;
-    let cmd = match body.to_cli_command(chip.as_deref()) {
+    let cmd = match body.to_cli_command(chip.as_deref(), dev.profile.as_ref()) {
         Ok(c) => c,
         Err(message) => return bad_request(message),
     };

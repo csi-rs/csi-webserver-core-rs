@@ -15,6 +15,7 @@ pub mod state;
 pub mod supervisor;
 
 pub use profile::{CsiProfile, StandardCsiProfile};
+pub use serial::{ExternalDeviceChannels, spawn_external_device};
 pub use server::{ServerConfig, build_router, serve};
 pub use state::{AppState, DeviceAttachSpec, DeviceHandle, DeviceRegistry};
 pub use supervisor::{PortInfo, SupervisorConfig, detect_esp_ports, probe_port, run_supervisor};

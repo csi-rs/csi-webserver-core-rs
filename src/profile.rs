@@ -25,6 +25,15 @@ pub trait CsiProfile: Send + Sync {
         &[]
     }
 
+    /// Extra `set-wifi --mode=<…>` values accepted in addition to the core set
+    /// ([`WIFI_MODES`](crate::models)), e.g. a specialised node mode the base
+    /// build does not name. Any mode-specific flags ride through
+    /// [`WifiConfig::extra`](crate::models::WifiConfig::extra) and re-emit
+    /// generically, so the core still names none of them.
+    fn extra_wifi_modes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Resolve a named CSI preset to the cached config section it applies.
     /// `None` means the core does not recognise the preset name.
     fn resolve_preset(&self, name: &str) -> Option<CsiConfigSection> {

@@ -10,8 +10,10 @@
 //! `esp-csi-rs` is an `esp-hal` crate and cannot compile for a Linux host, so
 //! the wire types are re-declared here. postcard is **not** self-describing and
 //! uses varint encoding, so these mirrors must match the firmware field-for-
-//! field, in order. **Pinned to `esp-csi-rs` 0.8.0.** When the firmware bumps
-//! its protocol/struct, update these definitions in lockstep.
+//! field, in order. **Matched to `esp-csi-rs-core` 0.1.x** (the C5/C6
+//! `CSIDataPacket` layout, incl. HE20 frames carrying `cur_bb_format` 4/5 with
+//! `data_format = Undefined`). When the firmware bumps its protocol/struct,
+//! update these definitions in lockstep.
 //!
 //! ## Chip layouts
 //! The on-device `CSIDataPacket` has two shapes selected by `#[cfg]`:

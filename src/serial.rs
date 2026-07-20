@@ -154,6 +154,62 @@ pub fn spawn_device(spec: &DeviceAttachSpec, profile: Arc<dyn CsiProfile>) -> Ar
     dev
 }
 
+/// The receiver ends of a [`DeviceHandle`]'s channels that an EXTERNAL driver (instead of the local
+/// serial task) must service. Returned by [`spawn_external_device`].
+pub struct ExternalDeviceChannels {
+    /// CLI command strings the handle's `cmd_tx` accepts — forward these to wherever the board is.
+    pub cmd_rx: mpsc::Receiver<String>,
+    /// Output-mode changes (stream/dump/both). External drivers may ignore this.
+    pub output_mode_rx: watch::Receiver<OutputMode>,
+    /// Session dump-file path changes. External drivers may ignore this.
+    pub session_file_rx: watch::Receiver<Option<String>>,
+    /// `info` requests — answer each `InfoResponder` with the device's `DeviceInfo`.
+    pub info_request_rx: mpsc::Receiver<InfoResponder>,
+}
+
+/// Build a [`DeviceHandle`] NOT backed by a local serial task. The caller drives it: feed raw CSI
+/// frames into `handle.csi_tx`, drain [`ExternalDeviceChannels::cmd_rx`] to the board, and answer
+/// [`ExternalDeviceChannels::info_request_rx`]. Used for POOL-backed devices, where a remote
+/// `csi-device-pool` owns the serial port and this process is a client. Insert the returned handle
+/// with [`crate::DeviceRegistry::insert`]; the HTTP routes then work unchanged.
+pub fn spawn_external_device(
+    spec: &DeviceAttachSpec,
+    profile: Arc<dyn CsiProfile>,
+) -> (Arc<DeviceHandle>, ExternalDeviceChannels) {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<String>(64);
+    let (csi_tx, _) = broadcast::channel::<Vec<u8>>(CSI_BROADCAST_CAPACITY);
+    let (output_mode_tx, output_mode_rx) = watch::channel(OutputMode::default());
+    let (session_file_tx, session_file_rx) = watch::channel::<Option<String>>(None);
+    let (info_request_tx, info_request_rx) = mpsc::channel::<InfoResponder>(4);
+
+    let dev = Arc::new(DeviceHandle {
+        id: spec.id.clone(),
+        mac: spec.mac.clone(),
+        port_path: spec.port_path.clone(),
+        baud_rate: spec.baud_rate,
+        native_usb: spec.native_usb,
+        serial_connected: AtomicBool::new(false),
+        collection_running: AtomicBool::new(false),
+        firmware_verified: AtomicBool::new(false),
+        cmd_tx,
+        csi_tx,
+        output_mode_tx,
+        session_file_tx,
+        info_request_tx,
+        config: tokio::sync::Mutex::new(DeviceConfig::default()),
+        device_info: tokio::sync::Mutex::new(None),
+        fault: tokio::sync::Mutex::new(spec.fault.clone()),
+        recovery_cycles: std::sync::atomic::AtomicU32::new(spec.recovery_cycles),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        profile,
+    });
+
+    (
+        dev,
+        ExternalDeviceChannels { cmd_rx, output_mode_rx, session_file_rx, info_request_rx },
+    )
+}
+
 /// Background task: owns the serial port for its lifetime.
 ///
 /// - Continuously reconnects if the ESP32 disconnects.
