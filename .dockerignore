@@ -1,0 +1,4 @@
+# Used when this repo is a named build context (webcore) for the CSI backend image.
+# Exclude build output + VCS so the 4.7 GB target/ never enters the build.
+**/target/
+.git/
