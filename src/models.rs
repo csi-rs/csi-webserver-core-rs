@@ -322,6 +322,13 @@ pub struct WifiConfig {
     /// SoftAP secondary channel in `wifi-ap` mode: `above` | `below` |
     /// `none` | `off` (`off` is a firmware-side alias for `none`).
     pub ht40: Option<String>,
+    /// Which interface an emitter injects on: `sta` | `ap`. The driver
+    /// accepts raw TX on both, but which one actually radiates is
+    /// chip-dependent, so this is the first thing to flip when a collector
+    /// sees nothing while the emitter reports no rejected frames. Emitter
+    /// modes only; the firmware ignores it elsewhere and defaults to the
+    /// STA interface when the flag is omitted, so `None` sends nothing.
+    pub emitter_iface: Option<String>,
     /// Parameters the core does not name are carried verbatim here and
     /// re-emitted generically as `--{key}={value}` (same convention as
     /// [`CsiConfig::extra`]). This lets an embedder's [`CsiProfile`] accept
@@ -450,7 +457,17 @@ impl WifiConfig {
             cmd.push_str(&format!(" --ht40={ht40}"));
         }
 
-        // Profile-supplied / unknown params (e.g. an injector's inter-frame
+        if let Some(iface) = &self.emitter_iface {
+            match iface.as_str() {
+                "sta" | "ap" => {}
+                other => {
+                    return Err(format!("Invalid emitter_iface '{other}' (use sta or ap)"));
+                }
+            }
+            cmd.push_str(&format!(" --emitter-iface={iface}"));
+        }
+
+        // Profile-supplied / unknown params (e.g. an emitter's inter-frame
         // period) ride in `extra` and re-emit generically as `--{key}={value}`.
         for (key, value) in &self.extra {
             push_extra(&mut cmd, key, value);
@@ -843,6 +860,23 @@ pub struct DeviceInfo {
     pub features: Vec<String>,
 }
 
+/// The firmware CLI protocol this crate's command grammar targets
+/// (`CLI_PROTOCOL_VERSION` in `esp-csi-cli-rs`). Firmware reporting a
+/// different value — or none at all, which means a pre-protocol-2 build —
+/// may silently misinterpret the commands this crate composes, so hosts
+/// should treat a mismatch as "reflash required" rather than degrade.
+pub const SUPPORTED_CLI_PROTOCOL: u32 = 2;
+
+impl DeviceInfo {
+    /// Whether the firmware speaks exactly the CLI protocol this crate
+    /// targets. A missing `protocol=` line reads as unsupported: only
+    /// pre-protocol-2 firmware omits it, and that grammar predates the
+    /// emitter/collector rework.
+    pub fn protocol_supported(&self) -> bool {
+        self.protocol == Some(SUPPORTED_CLI_PROTOCOL)
+    }
+}
+
 // ─── Runtime status ───────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -910,6 +944,7 @@ mod tests {
             channel: None,
             peer_mac: peer_mac.map(str::to_string),
             ht40: ht40.map(str::to_string),
+            emitter_iface: None,
             extra: BTreeMap::new(),
         }
     }
@@ -990,6 +1025,46 @@ mod tests {
     }
 
     #[test]
+    fn wifi_emitter_iface_emits_and_validates() {
+        // `--emitter-iface` selects the injection interface. Only `sta` and
+        // `ap` exist; anything else is a typo the firmware would reject too.
+        for iface in ["sta", "ap"] {
+            let mut cfg = wifi("ht20-emitter", None, None);
+            cfg.emitter_iface = Some(iface.to_string());
+            let cmd = cfg.to_cli_command(None, &StandardCsiProfile).unwrap();
+            assert!(cmd.contains(&format!("--emitter-iface={iface}")), "{cmd}");
+        }
+        let mut cfg = wifi("ht20-emitter", None, None);
+        cfg.emitter_iface = Some("both".to_string());
+        assert!(cfg.to_cli_command(None, &StandardCsiProfile).is_err());
+        // Unset sends nothing: the firmware default (sta) applies.
+        let cmd = wifi("ht20-emitter", None, None)
+            .to_cli_command(None, &StandardCsiProfile)
+            .unwrap();
+        assert!(!cmd.contains("emitter-iface"), "{cmd}");
+    }
+
+    #[test]
+    fn device_info_protocol_support_is_exact() {
+        let info = |protocol| DeviceInfo {
+            banner_version: "0.7.0".to_string(),
+            name: Some("esp-csi-cli-rs".to_string()),
+            version: Some("0.7.0".to_string()),
+            chip: Some("esp32c6".to_string()),
+            mac: None,
+            protocol,
+            features: Vec::new(),
+        };
+        assert!(info(Some(SUPPORTED_CLI_PROTOCOL)).protocol_supported());
+        // Older and newer grammars are both refused: the composed commands
+        // may parse differently (or not at all) on either side.
+        assert!(!info(Some(1)).protocol_supported());
+        assert!(!info(Some(3)).protocol_supported());
+        // No `protocol=` line means pre-protocol-2 firmware.
+        assert!(!info(None).protocol_supported());
+    }
+
+    #[test]
     fn wifi_station_forwards_explicit_channel_hint() {
         // An explicit channel in station mode is forwarded as a pre-association
         // band-selection hint.
@@ -1005,6 +1080,7 @@ mod tests {
             channel: Some(6),
             peer_mac: None,
             ht40: None,
+            emitter_iface: None,
             extra: BTreeMap::new(),
         }
         .to_cli_command(None, &StandardCsiProfile)
@@ -1032,6 +1108,7 @@ mod tests {
             channel: None,
             peer_mac: None,
             ht40: None,
+            emitter_iface: None,
             extra: BTreeMap::new(),
         }
         .to_cli_command(Some("esp32c5"), &StandardCsiProfile)
@@ -1053,6 +1130,7 @@ mod tests {
             channel: None,
             peer_mac: None,
             ht40: None,
+            emitter_iface: None,
             extra: BTreeMap::new(),
         }
         .to_cli_command(Some("esp32c5"), &StandardCsiProfile)
@@ -1077,6 +1155,7 @@ mod tests {
             channel: Some(6),
             peer_mac: None,
             ht40: None,
+            emitter_iface: None,
             extra: BTreeMap::new(),
         }
         .to_cli_command(None, &StandardCsiProfile)
@@ -1101,6 +1180,7 @@ mod tests {
             channel: Some(6),
             peer_mac: None,
             ht40: None,
+            emitter_iface: None,
             extra: BTreeMap::new(),
         }
         .to_cli_command(None, &StandardCsiProfile)

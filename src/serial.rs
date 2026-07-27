@@ -423,6 +423,15 @@ async fn run_serial_connection(
                 info.banner_version,
                 info.chip.as_deref().unwrap_or("unknown chip"),
             );
+            if !info.protocol_supported() {
+                // The core stays permissive (single-device, operator-driven);
+                // fleet hosts read `DeviceInfo.protocol` and enforce.
+                tracing::warn!(
+                    "Firmware speaks CLI protocol {:?}; this host targets {} — composed commands may misparse, reflash advised",
+                    info.protocol,
+                    crate::models::SUPPORTED_CLI_PROTOCOL,
+                );
+            }
             chip = ChipInfo::from_info(&info);
             firmware_verified.store(true, Ordering::SeqCst);
             *device_info.lock().await = Some(info);
@@ -566,6 +575,13 @@ async fn run_serial_connection(
                             info.banner_version,
                             info.chip.as_deref().unwrap_or("unknown chip"),
                         );
+                        if !info.protocol_supported() {
+                            tracing::warn!(
+                                "Firmware speaks CLI protocol {:?}; this host targets {} — composed commands may misparse, reflash advised",
+                                info.protocol,
+                                crate::models::SUPPORTED_CLI_PROTOCOL,
+                            );
+                        }
                         chip = ChipInfo::from_info(&info);
                         firmware_verified.store(true, Ordering::SeqCst);
                         *device_info.lock().await = Some(info);
