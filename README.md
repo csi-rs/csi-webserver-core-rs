@@ -21,6 +21,32 @@ For the ready-to-run executable, see [`csi-webserver`](https://github.com/csi-rs
 - USB hotplug supervisor ([`supervisor`](src/supervisor.rs))
 - Explicit device registration ([`DeviceRegistry::attach`](src/state.rs))
 
+## Node modes
+
+`POST /api/config/wifi` mirrors the firmware's `set-wifi --mode=` grammar. A node
+either **emits** — puts known RF energy on the channel and captures nothing — or
+**collects** the channel response:
+
+| Mode | Role | Capture path / TX |
+|------|------|-------------------|
+| `station` | collector | Associate with an AP and measure its downlink |
+| `sniffer` | collector | Promiscuous channel lock; the mode that pairs with an emitter |
+| `wifi-ap` | collector | Self-contained softAP (pair with a `station` node) |
+| `ht20-emitter` | emitter | Unassociated raw 802.11n HT PPDU injection, 20 MHz |
+| `ht40-emitter` | emitter | Same, 40 MHz |
+
+`station` / `sniffer` / `wifi-ap` are *capture paths* of the collector role, not
+roles of their own. Modes this crate does not name — chip-gated or proprietary
+emitters and collectors — are supplied by an embedder through
+[`CsiProfile::extra_wifi_modes`](src/profile.rs); their mode-specific flags ride
+through the flattened `extra` map on the request body and re-emit verbatim as
+`--{key}={value}`, so the open core never names any of them.
+
+`POST /api/config/csi-output` (`{ "enabled": true|false }`) gates off-device
+delivery of captured CSI — capture and its RX timing are unchanged either way,
+and the gate is a no-op on an emitter. It replaces the removed
+`POST /api/config/collection-mode`.
+
 ## Quick embed
 
 ```toml

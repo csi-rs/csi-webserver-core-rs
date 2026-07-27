@@ -1,0 +1,42 @@
+name: CI
+
+# The crate's unit tests are the canary for a host/firmware CLI-grammar
+# mismatch: the accepted `set-wifi --mode=` table and the `set-*` command
+# round-trips are asserted string-for-string. Run them on every push and PR so a
+# grammar change cannot land silently.
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain with clippy
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - name: Cache cargo registry and target dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - run: cargo build
+
+      - run: cargo test
+
+      - run: cargo clippy --all-targets -- -D warnings
