@@ -27,5 +27,13 @@ serde_json = "1"
 tracing = "0.1"
 chrono = { version = "0.4", features = ["clock"] }
 postcard = { version = "1", features = ["use-std"] }
-arrow = "59"
-parquet = { version = "59", features = ["arrow"] }
+# The `arrow` facade is deliberately not used — it is the sole parent of arrow-cast, arrow-ord,
+# arrow-arith, arrow-row, arrow-string, arrow-csv and arrow-json, none of which this crate touches
+# (`parquet_sink.rs` uses only array/datatypes/record_batch/error). This must stay in step with
+# csi-pipeline-agent's declaration: it is a dependency of the agent, so a default-featured `arrow`
+# here would put the whole umbrella back into the agent's graph regardless of what the agent asks for.
+arrow-array = "59"
+arrow-schema = "59"
+# SNAPPY is what this sink writes; zstd is what csi-pipeline-agent's recorder writes. Both are needed
+# because either crate may read the other's files.
+parquet = { version = "59", default-features = false, features = ["arrow", "zstd", "snap"] }
