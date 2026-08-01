@@ -669,6 +669,21 @@ async fn run_serial_connection(
                 }
             }
 
+            // ## KNOWN DEFECT, recorded here because this is where it is caused
+            //
+            // `read_until` is documented as **not cancellation-safe**: "if the method is used as an
+            // event in a `tokio::select!` statement and some other branch completes first, then some
+            // data may have been partially read". It is exactly that here, and `buf` is reused across
+            // iterations — so when a sibling arm fires mid-frame, the partial bytes remain in `buf` and
+            // the next `read_until` APPENDS the following frame onto them. The consumer then sees one
+            // buffer holding the tail of frame N followed by all of frame N+1, COBS deframing fails,
+            // and that frame is dropped (`csi-device-pool::device` logs it and counts `undecodable`).
+            //
+            // Impact is one lost frame per occurrence, not a stalled stream: the next delimiter resyncs.
+            // The fix is to stop framing inside the `select!` — read with a cancel-safe primitive
+            // (`AsyncReadExt::read` into a scratch buffer) and split on `DELIMITER` here — which is a
+            // change to the hot ingest path for every device and wants its own hardware pass rather
+            // than riding along with unrelated fixes.
             result = reader.read_until(DELIMITER, &mut buf) => {
                 match result {
                     Ok(0) => {
