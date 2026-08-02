@@ -156,6 +156,35 @@ pub fn spawn_device(spec: &DeviceAttachSpec, profile: Arc<dyn CsiProfile>) -> Ar
 
 /// The receiver ends of a [`DeviceHandle`]'s channels that an EXTERNAL driver (instead of the local
 /// serial task) must service. Returned by [`spawn_external_device`].
+/// The port a board with this USB serial number is on RIGHT NOW, if it is present.
+///
+/// Espressif's native USB-Serial-JTAG reports the board MAC as its USB serial number, so this is a
+/// stable identity across re-enumeration where the `/dev` path explicitly is not. Comparison is
+/// case-insensitive and separator-insensitive because the two sources disagree on formatting: udev
+/// yields `10:BD:A3:CA:34:98` while device ids elsewhere use `10-BD-A3-CA-34-98`.
+fn normalize_serial(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_uppercase())
+        .collect()
+}
+
+fn resolve_port_by_serial(mac: &str) -> Option<String> {
+    let norm = normalize_serial;
+    let want = norm(mac);
+    if want.is_empty() {
+        return None;
+    }
+    tokio_serial::available_ports().ok()?.into_iter().find_map(|p| match &p.port_type {
+        tokio_serial::SerialPortType::UsbPort(info)
+            if info.serial_number.as_deref().map(norm).as_deref() == Some(want.as_str()) =>
+        {
+            Some(p.port_name)
+        }
+        _ => None,
+    })
+}
+
 pub struct ExternalDeviceChannels {
     /// CLI command strings the handle's `cmd_tx` accepts — forward these to wherever the board is.
     pub cmd_rx: mpsc::Receiver<String>,
@@ -226,13 +255,38 @@ pub async fn run_serial_task(
     mut session_file_rx: watch::Receiver<Option<String>>,
     mut info_request_rx: mpsc::Receiver<InfoResponder>,
 ) {
-    let port_path = dev.port_path.clone();
+    let mut port_path = dev.port_path.clone();
     let baud = dev.baud_rate;
     const RECONNECT_DELAY: Duration = Duration::from_millis(800);
 
     loop {
         if dev.shutdown.is_cancelled() {
             break;
+        }
+
+        // Follow the board if the kernel moved it.
+        //
+        // A native USB-Serial-JTAG part (ESP32-C5/C6, native-USB S3) RE-ENUMERATES whenever it
+        // resets — which is every flash, and every USB fault on the bus. The kernel then hands it
+        // the next free `ttyACMn`, which is frequently NOT the one it had. This task used to retry
+        // `dev.port_path` forever and log "No such file or directory" until someone replugged it, so
+        // a board that flashed perfectly well never came back and looked like a flash failure.
+        //
+        // Re-resolving by the USB serial number rather than by "find any ESP" is what keeps the
+        // original anti-race property: for an Espressif native-USB part the serial number IS the
+        // board's MAC, so it identifies exactly one physical device and two tasks can never converge
+        // on the same port. A bridge (CP210x/CH340) does not re-enumerate on chip reset and usually
+        // has no unique serial, so it keeps its path — hence this only moves when it can prove where.
+        if let Some(mac) = dev.mac.as_deref() {
+            if let Some(found) = resolve_port_by_serial(mac) {
+                if found != port_path {
+                    tracing::info!(
+                        "{} moved {} -> {} (re-enumerated); following it",
+                        mac, port_path, found
+                    );
+                    port_path = found;
+                }
+            }
         }
 
         let mut stream = match tokio_serial::new(&port_path, baud).open_native_async() {
@@ -1171,6 +1225,26 @@ fn sync_parquet_sink(
 
 #[cfg(test)]
 mod tests {
+    use super::normalize_serial;
+
+    /// udev and our device ids format a MAC differently; matching must not care.
+    ///
+    /// This is the whole correctness of following a re-enumerated board: udev reports
+    /// `10:BD:A3:CA:34:98` as the USB serial while device ids elsewhere use `10-BD-A3-CA-34-98`. A
+    /// literal comparison never matches, the board is never found at its new path, and the fix
+    /// silently does nothing — which is worse than not having it, because the logs would claim it
+    /// looked.
+    #[test]
+    fn serial_matching_ignores_case_and_separators() {
+        let a = normalize_serial("10:BD:A3:CA:34:98");
+        assert_eq!(a, normalize_serial("10-BD-A3-CA-34-98"));
+        assert_eq!(a, normalize_serial("10bda3ca3498"));
+        assert_eq!(a, "10BDA3CA3498");
+        // Distinct boards must not collide.
+        assert_ne!(a, normalize_serial("10:BD:A3:CE:E5:B0"));
+        // An empty or punctuation-only serial must not match everything.
+        assert_eq!(normalize_serial(":::"), "");
+    }
     use super::detect_boot_fault;
 
     /// The exact banner an ESP32-C5 spews when wedged in the USB-JTAG reset
