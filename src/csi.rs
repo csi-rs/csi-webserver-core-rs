@@ -430,21 +430,45 @@ impl From<PacketBc6> for DecodedCsi {
 /// diagnostics) is skipped rather than guessed. A table indexed by chip would be a second place for
 /// the layout to be wrong, and it would go stale the next time a field is added for one part.
 ///
-/// ## What the format cannot carry
+/// ## Transmission identity
 ///
-/// There is **no `mac` and no `frame_seq`** in an array-list line. Those are the transmission's
-/// identity, and without them a cross-receiver join cannot pair "the same packet seen by two
-/// boards" — it falls back to pairing on arrival time, which `align_frames` supports and reports as
-/// such. So a defmt capture is usable for per-receiver work and weaker for anything comparing
-/// receivers. `mac` is left zeroed rather than invented; a fabricated identity would let the join
-/// pair packets that were never the same transmission.
+/// Both halves of it survive. `frame_seq` is the leading `sequence_number` field — the pool maps
+/// `frame_seq: Some(decoded.sequence_number)` — and `mac` arrives in the tail the firmware appends
+/// after the payload. So an array-list capture can be joined on `(mac, frame_seq)`, the same key the
+/// binary path uses, and nothing is lost for phase sync.
+///
+/// A line with no tail (an older build, mid-rollout) yields a zeroed `mac`, which degrades that
+/// capture to arrival-time pairing rather than discarding it. Zeroed rather than invented: a
+/// fabricated identity would let the join pair packets that were never the same transmission.
+/// `aa:bb:cc:dd:ee:ff` → six bytes. `None` for anything else, including an empty tail.
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut parts = s.split(':');
+    for slot in out.iter_mut() {
+        *slot = u8::from_str_radix(parts.next()?.trim(), 16).ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(out)
+}
+
 pub fn decode_array_list(line: &str) -> Option<DecodedCsi> {
     let line = line.trim();
     let body = line.strip_prefix('[')?.strip_suffix(']')?;
     // The payload array is the tail; the header is everything before it.
     let open = body.rfind('[')?;
     let header = body[..open].trim_end_matches(',');
-    let payload = body[open + 1..].strip_suffix(']')?;
+    // The payload array, then whatever identity tail follows it.
+    //
+    // The firmware appends `,<mac>` after the payload's `]` so the header's per-chip field positions
+    // stay put — see `format_array_list_into`. Split at the payload's own close rather than the end
+    // of the line, and treat a missing tail as a line from an older build rather than a malformed
+    // one: a fleet runs mixed firmware during a rollout, and refusing those would drop real captures.
+    let rest = &body[open + 1..];
+    let close = rest.find(']')?;
+    let payload = &rest[..close];
+    let tail = rest[close + 1..].trim_start_matches(',').trim();
 
     let nums: Vec<i64> = header
         .split(',')
@@ -474,7 +498,7 @@ pub fn decode_array_list(line: &str) -> Option<DecodedCsi> {
     }
 
     Some(DecodedCsi {
-        mac: [0u8; 6],
+        mac: parse_mac(tail).unwrap_or([0u8; 6]),
         sequence_number: nums[0] as u16,
         rssi: nums[1] as i32,
         rate: nums[2] as u32,
@@ -695,8 +719,7 @@ mod array_list_tests {
         assert_eq!(d.timestamp, 123456);
         assert_eq!(d.csi_data_len, 6);
         assert_eq!(d.csi_data, vec![1, -2, 3, -4, 5, -6]);
-        // The identity the format does not carry is absent, not invented: a fabricated MAC would let
-        // the cross-receiver join pair packets that were never the same transmission.
+        // No tail on this line, so identity degrades rather than being invented.
         assert_eq!(d.mac, [0u8; 6]);
     }
 
@@ -734,5 +757,40 @@ mod array_list_tests {
         assert!(decode_array_list("[1,2,3,4,5,6,7,8,9,2,[1,x]]").is_none(), "non-numeric payload");
         // An empty payload with a matching count is legitimate: a metadata-only packet.
         assert!(decode_array_list("[1,2,3,4,5,6,7,8,9,0,[]]").is_some());
+    }
+
+    /// The identity tail is read, so an array-list capture joins on `(mac, frame_seq)` like the
+    /// binary path — nothing is lost for phase sync.
+    #[test]
+    fn the_identity_tail_carries_mac_and_frame_seq_survives_as_field_zero() {
+        let line = "[7,-42,11,-96,149,123456,120,0,384,4,1,384,9,149,120,6,\
+                    [1,-2,3,-4,5,-6],10:bd:a3:ce:e5:b0]";
+        let d = decode_array_list(line).expect("a line with an identity tail");
+        assert_eq!(d.mac, [0x10, 0xbd, 0xa3, 0xce, 0xe5, 0xb0]);
+        // `frame_seq` is this field: the pool maps `frame_seq: Some(decoded.sequence_number)`.
+        assert_eq!(d.sequence_number, 7);
+        assert_eq!(d.csi_data, vec![1, -2, 3, -4, 5, -6]);
+    }
+
+    /// A line from a build that predates the tail still parses — a fleet runs mixed firmware during
+    /// a rollout, and refusing those would drop real captures.
+    #[test]
+    fn a_line_without_a_tail_still_parses_with_a_zeroed_mac() {
+        let line = "[7,-42,11,-96,149,123456,120,0,384,4,1,384,9,149,120,6,[1,-2,3,-4,5,-6]]";
+        let d = decode_array_list(line).expect("an older line is still readable");
+        assert_eq!(d.mac, [0u8; 6]);
+        assert_eq!(d.sequence_number, 7);
+    }
+
+    /// A malformed tail is not a fabricated identity.
+    #[test]
+    fn a_bad_mac_tail_degrades_rather_than_inventing_one() {
+        for tail in ["zz:bd:a3:ce:e5:b0", "10:bd:a3", "10:bd:a3:ce:e5:b0:99"] {
+            let line = format!(
+                "[7,-42,11,-96,149,123456,120,0,384,4,1,384,9,149,120,2,[1,-2],{tail}]"
+            );
+            let d = decode_array_list(&line).expect("the frame itself is still good");
+            assert_eq!(d.mac, [0u8; 6], "tail {tail:?} must not become an identity");
+        }
     }
 }
