@@ -272,25 +272,35 @@ fn validate_peer_mac(mac: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Accepted `set-wifi --mode=` values (esp-csi-cli-rs v0.7.0).
+/// Accepted `set-wifi --mode=` values — one per **operational mode** the firmware offers.
 ///
-/// A node either **emits** — puts known RF energy on the channel and captures
-/// nothing — or **collects** the channel response. `station`, `sniffer`, and
-/// `wifi-ap` are the collector role's three capture paths (associated downlink,
-/// promiscuous channel lock, self-contained softAP), not roles of their own;
-/// `ht20-emitter` and `ht40-emitter` inject raw 802.11n HT PPDUs unassociated
-/// and build on every chip.
+/// A node is described by four independent attributes, of which the mode is one; the others
+/// (network role, collection mode, session role) are not chosen here because each mode carries only
+/// the ones it admits. The model is documented once, in `esp-csi-rs/docs/network-model.md`, and
+/// deliberately not restated here.
 ///
-/// Modes the open core does not name — chip-gated or proprietary emitters and
-/// collectors — arrive through
-/// [`CsiProfile::extra_wifi_modes`](crate::profile::CsiProfile::extra_wifi_modes)
-/// with their mode-specific flags riding in [`WifiConfig::extra`].
+/// This list must stay a superset of what the firmware accepts. It was previously short by the four
+/// ESP-NOW modes, which the firmware and the CLI both shipped throughout — so every `esp-now-*`
+/// mode a user could select on the console was rejected by this API.
+///
+/// Modes this crate does not name — chip-gated ones, or those supplied by a build it does not
+/// target — arrive through
+/// [`CsiProfile::extra_wifi_modes`](crate::profile::CsiProfile::extra_wifi_modes) with their
+/// mode-specific flags riding in [`WifiConfig::extra`].
 const WIFI_MODES: &[&str] = &[
     "station",
     "sniffer",
     "wifi-ap",
     "ht20-emitter",
     "ht40-emitter",
+    "esp-now-central",
+    "esp-now-peripheral",
+    // Two spellings per simplex end: the `-fast-` strings are what the firmware has always
+    // accepted, the `-simplex-` ones match the model, where the end that floods is the central.
+    "esp-now-fast-collector",
+    "esp-now-fast-source",
+    "esp-now-simplex-peer",
+    "esp-now-simplex-source",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -980,20 +990,21 @@ mod tests {
     }
 
     #[test]
-    fn wifi_extra_forwards_hop_params_verbatim() {
-        // Channel-hopping flags (--hop-list / --hop-channel / --hop-burst /
-        // --hop-follow-ms) belong to the proprietary HE20 emitter/collector pair
-        // the open core does not name; they ride through `extra` and must
-        // re-emit unquoted — the CSV hop list in particular must survive as
-        // `1,5,9,13`, not `"1,5,9,13"`.
+    fn wifi_extra_forwards_unknown_flags_verbatim() {
+        // Flags belonging to a mode this crate does not name ride through `extra` and must re-emit
+        // unquoted. A CSV-valued flag is the case that catches quoting bugs: it has to survive as
+        // `a,b,c` rather than `"a,b,c"`.
+        //
+        // Deliberately generic. Naming a specific out-of-tree flag set here would document a
+        // feature this crate does not implement, which is the `extra` map's whole purpose to avoid.
         let mut cfg = wifi("ht20-emitter", None, None);
         cfg.extra
-            .insert("hop-list".to_string(), serde_json::json!("1,5,9,13"));
+            .insert("example-list".to_string(), serde_json::json!("1,5,9,13"));
         cfg.extra
-            .insert("hop-follow-ms".to_string(), serde_json::json!(75));
+            .insert("example-ms".to_string(), serde_json::json!(75));
         let cmd = cfg.to_cli_command(None, &StandardCsiProfile).unwrap();
-        assert!(cmd.contains("--hop-list=1,5,9,13"), "{cmd}");
-        assert!(cmd.contains("--hop-follow-ms=75"), "{cmd}");
+        assert!(cmd.contains("--example-list=1,5,9,13"), "{cmd}");
+        assert!(cmd.contains("--example-ms=75"), "{cmd}");
     }
 
     #[test]
@@ -1210,10 +1221,9 @@ mod tests {
 
     #[test]
     fn wifi_base_mode_table_is_exactly_the_open_vocabulary() {
-        // The base table mirrors the firmware CLI grammar: three collector
-        // capture paths plus the two open emitters, and nothing else. Any mode
-        // the core does not name — chip-gated or proprietary — must come in
-        // through the profile seam, never this list.
+        // The base table mirrors the firmware CLI grammar: one entry per operational mode this
+        // crate targets, and nothing else. Any mode it does not name — chip-gated, or supplied by
+        // a build it does not target — must come in through the profile seam, never this list.
         assert_eq!(
             WIFI_MODES,
             [
@@ -1221,7 +1231,13 @@ mod tests {
                 "sniffer",
                 "wifi-ap",
                 "ht20-emitter",
-                "ht40-emitter"
+                "ht40-emitter",
+                "esp-now-central",
+                "esp-now-peripheral",
+                "esp-now-fast-collector",
+                "esp-now-fast-source",
+                "esp-now-simplex-peer",
+                "esp-now-simplex-source",
             ]
         );
         for mode in WIFI_MODES {
@@ -1235,21 +1251,26 @@ mod tests {
     }
 
     #[test]
-    fn wifi_rejects_retired_esp_now_modes() {
-        // The firmware dropped the ESP-NOW central/peripheral architecture for
-        // the emitter/collector split. Accepting these again would mean emitting
-        // a `set-wifi --mode=` the firmware rejects.
-        for retired in [
+    fn wifi_accepts_every_esp_now_mode() {
+        // This test previously asserted the opposite, on the belief that the firmware had dropped
+        // ESP-NOW. It had not: the crate and the CLI shipped those four modes throughout, so this
+        // API was rejecting `set-wifi --mode=` values a user could select on the console.
+        //
+        // Both simplex spellings are accepted. `-fast-` is what the firmware has always taken;
+        // `-simplex-` matches the node model, where the end that floods is the central.
+        for mode in [
             "esp-now-central",
             "esp-now-peripheral",
             "esp-now-fast-collector",
             "esp-now-fast-source",
+            "esp-now-simplex-peer",
+            "esp-now-simplex-source",
         ] {
             assert!(
-                wifi(retired, None, None)
+                wifi(mode, None, None)
                     .to_cli_command(None, &StandardCsiProfile)
-                    .is_err(),
-                "retired mode {retired} must be rejected"
+                    .is_ok(),
+                "mode {mode} must be accepted"
             );
         }
     }
@@ -1263,11 +1284,9 @@ mod tests {
             .is_err());
     }
 
-    /// A profile that names an extra emitter/collector pair, standing in for an
-    /// out-of-tree capability crate (the real one supplies two proprietary modes
-    /// plus their injection and channel-hopping flags). The open core must accept
-    /// both modes and re-emit any unknown `extra` params generically, without
-    /// naming either itself.
+    /// A profile that names an extra pair of modes, standing in for an out-of-tree capability
+    /// crate. This crate must accept both and re-emit any unknown `extra` params generically,
+    /// without naming either itself.
     struct ExtraModeProfile;
     impl CsiProfile for ExtraModeProfile {
         fn extra_wifi_modes(&self) -> &'static [&'static str] {
@@ -1306,7 +1325,10 @@ mod tests {
         assert_eq!(
             err,
             "Unknown wifi mode 'mesh'; expected one of: station, sniffer, \
-             wifi-ap, ht20-emitter, ht40-emitter, custom-emitter, custom-collector"
+             wifi-ap, ht20-emitter, ht40-emitter, esp-now-central, \
+             esp-now-peripheral, esp-now-fast-collector, esp-now-fast-source, \
+             esp-now-simplex-peer, esp-now-simplex-source, custom-emitter, \
+             custom-collector"
         );
     }
 

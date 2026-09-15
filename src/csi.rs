@@ -10,12 +10,12 @@
 //! `esp-csi-rs` is an `esp-hal` crate and cannot compile for a Linux host, so
 //! the wire types are re-declared here. postcard is **not** self-describing and
 //! uses varint encoding, so these mirrors must match the firmware field-for-
-//! field, in order. **Matched to `esp-csi-rs-core` 0.1.x** (the C5/C6
-//! `CSIDataPacket` layout). That includes the frames a proprietary HE20
-//! collector reports, which arrive with `cur_bb_format` 4/5 and
-//! `data_format = Undefined`: the layout is the same, so the open core decodes
-//! them structurally, but it deliberately does not *name* that format — the
-//! label comes from [`CsiProfile::label_format`](crate::profile::CsiProfile::label_format).
+//! field, in order. **Matched to `esp-csi-rs` 0.11** (the C5/C6 `CSIDataPacket`
+//! layout). That includes frames whose `data_format` this crate reports as
+//! `Undefined`: the layout is the same whatever produced them, so they decode
+//! structurally, but naming a format this crate does not implement is not its
+//! job — the label comes from
+//! [`CsiProfile::label_format`](crate::profile::CsiProfile::label_format).
 //! When the firmware bumps its protocol/struct, update these definitions in
 //! lockstep.
 //!
@@ -752,7 +752,7 @@ mod array_list_tests {
     #[test]
     fn malformed_input_is_refused() {
         assert!(decode_array_list("").is_none());
-        assert!(decode_array_list("he20-stats rx=49").is_none());
+        assert!(decode_array_list("stats rx=49").is_none());
         assert!(decode_array_list("[1,2,3,[1,2]]").is_none(), "header too short");
         assert!(decode_array_list("[1,2,3,4,5,6,7,8,9,2,[1,x]]").is_none(), "non-numeric payload");
         // An empty payload with a matching count is legitimate: a metadata-only packet.
