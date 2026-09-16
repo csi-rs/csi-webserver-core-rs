@@ -20,12 +20,14 @@
 use std::fs::File;
 use std::sync::Arc;
 
-use arrow::array::{
-    ArrayRef, Int32Array, Int8Builder, ListBuilder, StringArray, TimestampMicrosecondArray,
-    UInt16Array, UInt32Array, UInt64Array,
+// The two arrow subcrates directly rather than the `arrow` facade — see this crate's Cargo.toml for
+// why (the facade drags in seven subcrates nothing here touches).
+use arrow_array::builder::{Int8Builder, ListBuilder};
+use arrow_array::{
+    ArrayRef, Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt16Array,
+    UInt32Array, UInt64Array,
 };
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow::record_batch::RecordBatch;
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -342,7 +344,7 @@ fn build_schema() -> Arc<Schema> {
 #[derive(Debug)]
 pub enum ParquetSinkError {
     Io(std::io::Error),
-    Arrow(arrow::error::ArrowError),
+    Arrow(arrow_schema::ArrowError),
     Parquet(parquet::errors::ParquetError),
 }
 
@@ -363,8 +365,8 @@ impl From<std::io::Error> for ParquetSinkError {
         Self::Io(e)
     }
 }
-impl From<arrow::error::ArrowError> for ParquetSinkError {
-    fn from(e: arrow::error::ArrowError) -> Self {
+impl From<arrow_schema::ArrowError> for ParquetSinkError {
+    fn from(e: arrow_schema::ArrowError) -> Self {
         Self::Arrow(e)
     }
 }

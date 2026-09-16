@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 
 use crate::{
     models::{
-        default_wifi_channel, ApiResponse, CollectionModeConfig, CsiConfig, CsiDeliveryConfig,
+        default_wifi_channel, ApiResponse, CsiConfig, CsiDeliveryConfig, CsiOutputConfig,
         DeviceConfig, IoTasksConfig, OutputMode, OutputModeConfig, ProtocolConfig, RateConfig,
         TrafficConfig, WifiConfig,
     },
@@ -128,19 +128,18 @@ pub async fn set_csi(
     result
 }
 
-// ─── POST /api/config/collection-mode ──────────────────────────────────────
+// ─── POST /api/config/csi-output ───────────────────────────────────────────
 
-pub async fn set_collection_mode(
+/// Gate off-device delivery of captured CSI (`{ "enabled": true|false }`).
+/// The device keeps capturing with delivery off, so the RX path and its timing
+/// are unchanged; an emitter captures nothing, so the gate is a no-op there.
+pub async fn set_csi_output(
     Device(dev): Device,
-    Json(body): Json<CollectionModeConfig>,
+    Json(body): Json<CsiOutputConfig>,
 ) -> (StatusCode, Json<ApiResponse>) {
-    let cmd = match body.to_cli_command() {
-        Ok(c) => c,
-        Err(message) => return bad_request(message),
-    };
-    let result = send_cmd(&dev, cmd).await;
+    let result = send_cmd(&dev, body.to_cli_command()).await;
     if result.0 == StatusCode::OK {
-        dev.config.lock().await.collection.mode = Some(body.mode);
+        dev.config.lock().await.collection.csi_output_enabled = Some(body.enabled);
     }
     result
 }

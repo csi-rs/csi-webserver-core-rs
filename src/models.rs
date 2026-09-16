@@ -43,8 +43,10 @@ pub struct DeviceConfig {
 /// `[WiFi]` section in `show-config`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WifiSection {
-    /// `node_mode` — `sniffer` | `station` | `wifi-ap` | `esp-now-central` |
-    /// `esp-now-peripheral` | `esp-now-fast-collector` | `esp-now-fast-source`.
+    /// `node_mode` — `sniffer` | `station` | `wifi-ap` | `ht20-emitter` |
+    /// `ht40-emitter`, plus any mode the active
+    /// [`CsiProfile`](crate::profile::CsiProfile) adds. See [`WIFI_MODES`] for
+    /// the emitter/collector split behind those names.
     pub mode: Option<String>,
     /// `channel` — `u8`. Valid Wi-Fi 2.4 GHz: 1..=14.
     pub channel: Option<u8>,
@@ -62,19 +64,22 @@ pub struct WifiSection {
     /// `ap_sync_burst` — synchronized burst flood in `wifi-ap` mode.
     /// Reported as `AP Burst` in `show-config`.
     pub ap_burst: Option<bool>,
-    /// `peer_mac` — explicit ESP-NOW source-MAC filter, or `auto` for the
-    /// default magic-prefix pairing. ESP-NOW modes only.
+    /// `peer_mac` — destination address of the frames an emitter injects,
+    /// reported as `Dst MAC` in `show-config`. `broadcast` is the firmware
+    /// default. Emitter modes only.
     pub peer_mac: Option<String>,
-    /// `ht40_secondary` — forced ESP-NOW TX secondary channel:
-    /// `above` | `below` | `none` (HT20/legacy). ESP-NOW modes only.
+    /// `ht40_secondary` — softAP secondary channel in `wifi-ap` mode:
+    /// `above` | `below` | `none` (`none` = HT20/legacy).
     pub ht40: Option<String>,
 }
 
 /// `[Collection]` section in `show-config`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CollectionSection {
-    /// `collection_mode` — `collector` | `listener`.
-    pub mode: Option<String>,
+    /// `csi_output_enabled` — reported as `CSI Output` in `show-config`.
+    /// Whether captured CSI is delivered off-device; capture itself keeps
+    /// running either way. Set via [`CsiOutputConfig`].
+    pub csi_output_enabled: Option<bool>,
     /// `trigger_freq` Hz. `0` disables traffic generation.
     pub traffic_hz: Option<u64>,
     /// `flood_unsolicited` — ICMP flood sends unsolicited echo replies
@@ -165,7 +170,7 @@ impl DeviceConfig {
     /// Like [`firmware_defaults`], with chip-specific Wi-Fi channel (C5 → 149,
     /// C6 → 6, others → 1) matching the esp-csi-cli-rs lab examples.
     pub fn firmware_defaults_for_chip(chip: Option<&str>) -> Self {
-        let defaults = Self {
+        Self {
             wifi: WifiSection {
                 mode: Some("sniffer".to_string()),
                 channel: Some(default_wifi_channel(chip)),
@@ -175,11 +180,11 @@ impl DeviceConfig {
                 ap_dhcp: Some(true),
                 ap_leases: Some(4),
                 ap_burst: Some(false),
-                peer_mac: Some("auto".to_string()),
+                peer_mac: Some("broadcast".to_string()),
                 ht40: Some("none".to_string()),
             },
             collection: CollectionSection {
-                mode: Some("collector".to_string()),
+                csi_output_enabled: Some(true),
                 traffic_hz: Some(100),
                 unsolicited: Some(false),
                 phy_rate: Some("mcs0-lgi".to_string()),
@@ -209,8 +214,7 @@ impl DeviceConfig {
             },
             csi_delivery_mode: None,
             csi_logging_enabled: None,
-        };
-        defaults
+        }
     }
 }
 
@@ -247,9 +251,9 @@ fn quote_cli_arg(s: &str) -> Result<String, String> {
 
 // ─── HTTP request bodies ───────────────────────────────────────────────────
 
-/// Validate an ESP-NOW peer MAC the way the firmware does: six hex octets
-/// separated by `:` or `-` (case-insensitive). An empty string is *valid* and
-/// means "clear back to auto".
+/// Validate an emitter's injection destination MAC the way the firmware does:
+/// six hex octets separated by `:` or `-` (case-insensitive). An empty string is
+/// *valid* and means "clear back to broadcast".
 fn validate_peer_mac(mac: &str) -> Result<(), String> {
     if mac.is_empty() {
         return Ok(());
@@ -268,15 +272,35 @@ fn validate_peer_mac(mac: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Accepted `set-wifi --mode=` values (esp-csi-cli-rs v0.7.0).
+/// Accepted `set-wifi --mode=` values — one per **operational mode** the firmware offers.
+///
+/// A node is described by four independent attributes, of which the mode is one; the others
+/// (network role, collection mode, session role) are not chosen here because each mode carries only
+/// the ones it admits. The model is documented once, in `esp-csi-rs/docs/network-model.md`, and
+/// deliberately not restated here.
+///
+/// This list must stay a superset of what the firmware accepts. It was previously short by the four
+/// ESP-NOW modes, which the firmware and the CLI both shipped throughout — so every `esp-now-*`
+/// mode a user could select on the console was rejected by this API.
+///
+/// Modes this crate does not name — chip-gated ones, or those supplied by a build it does not
+/// target — arrive through
+/// [`CsiProfile::extra_wifi_modes`](crate::profile::CsiProfile::extra_wifi_modes) with their
+/// mode-specific flags riding in [`WifiConfig::extra`].
 const WIFI_MODES: &[&str] = &[
     "station",
     "sniffer",
     "wifi-ap",
+    "ht20-emitter",
+    "ht40-emitter",
     "esp-now-central",
     "esp-now-peripheral",
+    // Two spellings per simplex end: the `-fast-` strings are what the firmware has always
+    // accepted, the `-simplex-` ones match the model, where the end that floods is the central.
     "esp-now-fast-collector",
     "esp-now-fast-source",
+    "esp-now-simplex-peer",
+    "esp-now-simplex-source",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -299,13 +323,22 @@ pub struct WifiConfig {
     /// multi-receiver CSI) instead of round-robining one station per tick.
     pub ap_burst: Option<bool>,
     pub channel: Option<u8>,
-    /// ESP-NOW peer source MAC (`aa:bb:cc:dd:ee:ff` or `aa-bb-...`). An empty
-    /// string clears the filter back to automatic magic-prefix pairing.
-    /// ESP-NOW modes only; ignored by the firmware in other modes.
+    /// Destination address of the frames an emitter injects
+    /// (`aa:bb:cc:dd:ee:ff` or `aa-bb-...`); unicasting to a collector's MAC
+    /// usually raises that collector's CSI rate. An empty string clears the
+    /// destination back to broadcast. Emitter modes only; ignored by the
+    /// firmware in the collector modes.
     pub peer_mac: Option<String>,
-    /// Forced ESP-NOW TX HT40 secondary channel: `above` | `below` |
-    /// `none` | `off`. ESP-NOW modes only.
+    /// SoftAP secondary channel in `wifi-ap` mode: `above` | `below` |
+    /// `none` | `off` (`off` is a firmware-side alias for `none`).
     pub ht40: Option<String>,
+    /// Which interface an emitter injects on: `sta` | `ap`. The driver
+    /// accepts raw TX on both, but which one actually radiates is
+    /// chip-dependent, so this is the first thing to flip when a collector
+    /// sees nothing while the emitter reports no rejected frames. Emitter
+    /// modes only; the firmware ignores it elsewhere and defaults to the
+    /// STA interface when the flag is omitted, so `None` sends nothing.
+    pub emitter_iface: Option<String>,
     /// Parameters the core does not name are carried verbatim here and
     /// re-emitted generically as `--{key}={value}` (same convention as
     /// [`CsiConfig::extra`]). This lets an embedder's [`CsiProfile`] accept
@@ -420,7 +453,7 @@ impl WifiConfig {
         if let Some(mac) = &self.peer_mac {
             validate_peer_mac(mac)?;
             // An empty value is forwarded verbatim (`--peer-mac=`) so the
-            // firmware clears the filter back to auto.
+            // firmware clears the destination back to broadcast.
             cmd.push_str(&format!(" --peer-mac={mac}"));
         }
 
@@ -434,7 +467,17 @@ impl WifiConfig {
             cmd.push_str(&format!(" --ht40={ht40}"));
         }
 
-        // Profile-supplied / unknown params (e.g. an injector's inter-frame
+        if let Some(iface) = &self.emitter_iface {
+            match iface.as_str() {
+                "sta" | "ap" => {}
+                other => {
+                    return Err(format!("Invalid emitter_iface '{other}' (use sta or ap)"));
+                }
+            }
+            cmd.push_str(&format!(" --emitter-iface={iface}"));
+        }
+
+        // Profile-supplied / unknown params (e.g. an emitter's inter-frame
         // period) ride in `extra` and re-emit generically as `--{key}={value}`.
         for (key, value) in &self.extra {
             push_extra(&mut cmd, key, value);
@@ -616,22 +659,25 @@ fn apply_u32_cache(slot: &mut Option<u32>, value: Option<bool>) {
     }
 }
 
+/// `POST /api/config/csi-output` — gate off-device delivery of captured CSI.
+///
+/// Replaces the old `set-collection-mode --mode=collector|listener`: `collector`
+/// now names the RX *role* (see [`WIFI_MODES`]), and the only part of that flag
+/// independent of the role was whether captured CSI leaves the device. Capture
+/// keeps running with delivery off, so the RX path and its timing are unchanged
+/// — nothing is decoded or logged. An emitter captures nothing, so the gate has
+/// no effect there.
 #[derive(Debug, Deserialize)]
-pub struct CollectionModeConfig {
-    /// `collector` or `listener`.
-    pub mode: String,
+pub struct CsiOutputConfig {
+    /// `--enabled=true|false`; the firmware default is `true`.
+    pub enabled: bool,
 }
 
-impl CollectionModeConfig {
-    pub fn to_cli_command(&self) -> Result<String, String> {
-        match self.mode.as_str() {
-            "collector" | "listener" => {
-                Ok(format!("set-collection-mode --mode={}", self.mode))
-            }
-            other => Err(format!(
-                "Unknown collection mode '{other}'; expected collector or listener"
-            )),
-        }
+impl CsiOutputConfig {
+    /// Unlike the mode string this replaced, a bool has no invalid value, so
+    /// the command cannot fail to build.
+    pub fn to_cli_command(&self) -> String {
+        format!("set-csi-output --enabled={}", self.enabled)
     }
 }
 
@@ -824,6 +870,23 @@ pub struct DeviceInfo {
     pub features: Vec<String>,
 }
 
+/// The firmware CLI protocol this crate's command grammar targets
+/// (`CLI_PROTOCOL_VERSION` in `esp-csi-cli-rs`). Firmware reporting a
+/// different value — or none at all, which means a pre-protocol-2 build —
+/// may silently misinterpret the commands this crate composes, so hosts
+/// should treat a mismatch as "reflash required" rather than degrade.
+pub const SUPPORTED_CLI_PROTOCOL: u32 = 2;
+
+impl DeviceInfo {
+    /// Whether the firmware speaks exactly the CLI protocol this crate
+    /// targets. A missing `protocol=` line reads as unsupported: only
+    /// pre-protocol-2 firmware omits it, and that grammar predates the
+    /// emitter/collector rework.
+    pub fn protocol_supported(&self) -> bool {
+        self.protocol == Some(SUPPORTED_CLI_PROTOCOL)
+    }
+}
+
 // ─── Runtime status ───────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -891,57 +954,125 @@ mod tests {
             channel: None,
             peer_mac: peer_mac.map(str::to_string),
             ht40: ht40.map(str::to_string),
+            emitter_iface: None,
             extra: BTreeMap::new(),
         }
     }
 
     #[test]
-    fn wifi_emits_peer_mac_and_ht40() {
-        let cmd = wifi("esp-now-central", Some("AA:BB:CC:DD:EE:FF"), Some("above"))
+    fn wifi_emitter_emits_injection_destination() {
+        // `--peer-mac` is the emitter's injection destination (unicast to one
+        // collector); the emitter modes take the operating channel too.
+        let cmd = wifi("ht20-emitter", Some("AA:BB:CC:DD:EE:FF"), None)
             .to_cli_command(None, &StandardCsiProfile)
             .unwrap();
         assert_eq!(
             cmd,
-            "set-wifi --mode=esp-now-central --set-channel=1 --peer-mac=AA:BB:CC:DD:EE:FF --ht40=above"
+            "set-wifi --mode=ht20-emitter --set-channel=1 --peer-mac=AA:BB:CC:DD:EE:FF"
         );
     }
 
     #[test]
-    fn wifi_empty_peer_mac_clears_to_auto() {
-        let cmd = wifi("esp-now-peripheral", Some(""), None)
+    fn wifi_ap_emits_ht40_secondary() {
+        // `--ht40` is the softAP secondary channel, i.e. a `wifi-ap` flag.
+        let cmd = wifi("wifi-ap", None, Some("above"))
             .to_cli_command(None, &StandardCsiProfile)
             .unwrap();
-        assert_eq!(cmd, "set-wifi --mode=esp-now-peripheral --set-channel=1 --peer-mac=");
+        assert_eq!(cmd, "set-wifi --mode=wifi-ap --set-channel=1 --ht40=above");
     }
 
     #[test]
-    fn wifi_extra_forwards_hop_params_verbatim() {
-        // Channel-hopping flags (--hop-list / --hop-channel / --hop-burst /
-        // --hop-follow-ms) are HE20-node keys the open core does not name; they
-        // ride through `extra` and must re-emit unquoted — the CSV hop list in
-        // particular must survive as `1,5,9,13`, not `"1,5,9,13"`.
-        let mut cfg = wifi("esp-now-central", None, None);
+    fn wifi_empty_peer_mac_clears_to_broadcast() {
+        let cmd = wifi("ht20-emitter", Some(""), None)
+            .to_cli_command(None, &StandardCsiProfile)
+            .unwrap();
+        assert_eq!(cmd, "set-wifi --mode=ht20-emitter --set-channel=1 --peer-mac=");
+    }
+
+    #[test]
+    fn wifi_extra_forwards_unknown_flags_verbatim() {
+        // Flags belonging to a mode this crate does not name ride through `extra` and must re-emit
+        // unquoted. A CSV-valued flag is the case that catches quoting bugs: it has to survive as
+        // `a,b,c` rather than `"a,b,c"`.
+        //
+        // Deliberately generic. Naming a specific out-of-tree flag set here would document a
+        // feature this crate does not implement, which is the `extra` map's whole purpose to avoid.
+        let mut cfg = wifi("ht20-emitter", None, None);
         cfg.extra
-            .insert("hop-list".to_string(), serde_json::json!("1,5,9,13"));
+            .insert("example-list".to_string(), serde_json::json!("1,5,9,13"));
         cfg.extra
-            .insert("hop-follow-ms".to_string(), serde_json::json!(75));
+            .insert("example-ms".to_string(), serde_json::json!(75));
         let cmd = cfg.to_cli_command(None, &StandardCsiProfile).unwrap();
-        assert!(cmd.contains("--hop-list=1,5,9,13"), "{cmd}");
-        assert!(cmd.contains("--hop-follow-ms=75"), "{cmd}");
+        assert!(cmd.contains("--example-list=1,5,9,13"), "{cmd}");
+        assert!(cmd.contains("--example-ms=75"), "{cmd}");
+    }
+
+    #[test]
+    fn wifi_emitter_emits_inject_period_from_extra() {
+        // `--inject-period-ms` is an emitter flag the core does not name; it
+        // rides through `extra` like any other unnamed parameter.
+        let mut cfg = wifi("ht40-emitter", None, None);
+        cfg.extra
+            .insert("inject-period-ms".to_string(), serde_json::json!(20));
+        let cmd = cfg.to_cli_command(None, &StandardCsiProfile).unwrap();
+        assert_eq!(
+            cmd,
+            "set-wifi --mode=ht40-emitter --set-channel=1 --inject-period-ms=20"
+        );
     }
 
     #[test]
     fn wifi_rejects_malformed_peer_mac() {
-        assert!(wifi("esp-now-central", Some("not-a-mac"), None)
+        assert!(wifi("ht20-emitter", Some("not-a-mac"), None)
             .to_cli_command(None, &StandardCsiProfile)
             .is_err());
     }
 
     #[test]
     fn wifi_rejects_bad_ht40() {
-        assert!(wifi("esp-now-central", None, Some("sideways"))
+        assert!(wifi("wifi-ap", None, Some("sideways"))
             .to_cli_command(None, &StandardCsiProfile)
             .is_err());
+    }
+
+    #[test]
+    fn wifi_emitter_iface_emits_and_validates() {
+        // `--emitter-iface` selects the injection interface. Only `sta` and
+        // `ap` exist; anything else is a typo the firmware would reject too.
+        for iface in ["sta", "ap"] {
+            let mut cfg = wifi("ht20-emitter", None, None);
+            cfg.emitter_iface = Some(iface.to_string());
+            let cmd = cfg.to_cli_command(None, &StandardCsiProfile).unwrap();
+            assert!(cmd.contains(&format!("--emitter-iface={iface}")), "{cmd}");
+        }
+        let mut cfg = wifi("ht20-emitter", None, None);
+        cfg.emitter_iface = Some("both".to_string());
+        assert!(cfg.to_cli_command(None, &StandardCsiProfile).is_err());
+        // Unset sends nothing: the firmware default (sta) applies.
+        let cmd = wifi("ht20-emitter", None, None)
+            .to_cli_command(None, &StandardCsiProfile)
+            .unwrap();
+        assert!(!cmd.contains("emitter-iface"), "{cmd}");
+    }
+
+    #[test]
+    fn device_info_protocol_support_is_exact() {
+        let info = |protocol| DeviceInfo {
+            banner_version: "0.7.0".to_string(),
+            name: Some("esp-csi-cli-rs".to_string()),
+            version: Some("0.7.0".to_string()),
+            chip: Some("esp32c6".to_string()),
+            mac: None,
+            protocol,
+            features: Vec::new(),
+        };
+        assert!(info(Some(SUPPORTED_CLI_PROTOCOL)).protocol_supported());
+        // Older and newer grammars are both refused: the composed commands
+        // may parse differently (or not at all) on either side.
+        assert!(!info(Some(1)).protocol_supported());
+        assert!(!info(Some(3)).protocol_supported());
+        // No `protocol=` line means pre-protocol-2 firmware.
+        assert!(!info(None).protocol_supported());
     }
 
     #[test]
@@ -960,6 +1091,7 @@ mod tests {
             channel: Some(6),
             peer_mac: None,
             ht40: None,
+            emitter_iface: None,
             extra: BTreeMap::new(),
         }
         .to_cli_command(None, &StandardCsiProfile)
@@ -987,6 +1119,7 @@ mod tests {
             channel: None,
             peer_mac: None,
             ht40: None,
+            emitter_iface: None,
             extra: BTreeMap::new(),
         }
         .to_cli_command(Some("esp32c5"), &StandardCsiProfile)
@@ -1008,6 +1141,7 @@ mod tests {
             channel: None,
             peer_mac: None,
             ht40: None,
+            emitter_iface: None,
             extra: BTreeMap::new(),
         }
         .to_cli_command(Some("esp32c5"), &StandardCsiProfile)
@@ -1032,6 +1166,7 @@ mod tests {
             channel: Some(6),
             peer_mac: None,
             ht40: None,
+            emitter_iface: None,
             extra: BTreeMap::new(),
         }
         .to_cli_command(None, &StandardCsiProfile)
@@ -1056,6 +1191,7 @@ mod tests {
             channel: Some(6),
             peer_mac: None,
             ht40: None,
+            emitter_iface: None,
             extra: BTreeMap::new(),
         }
         .to_cli_command(None, &StandardCsiProfile)
@@ -1084,45 +1220,116 @@ mod tests {
     }
 
     #[test]
-    fn wifi_fast_collector_emits_peer_mac_and_ht40() {
-        let cmd = wifi("esp-now-fast-collector", Some("aa:bb:cc:dd:ee:ff"), Some("below"))
-            .to_cli_command(None, &StandardCsiProfile)
-            .unwrap();
+    fn wifi_base_mode_table_is_exactly_the_open_vocabulary() {
+        // The base table mirrors the firmware CLI grammar: one entry per operational mode this
+        // crate targets, and nothing else. Any mode it does not name — chip-gated, or supplied by
+        // a build it does not target — must come in through the profile seam, never this list.
         assert_eq!(
-            cmd,
-            "set-wifi --mode=esp-now-fast-collector --set-channel=1 --peer-mac=aa:bb:cc:dd:ee:ff --ht40=below"
+            WIFI_MODES,
+            [
+                "station",
+                "sniffer",
+                "wifi-ap",
+                "ht20-emitter",
+                "ht40-emitter",
+                "esp-now-central",
+                "esp-now-peripheral",
+                "esp-now-fast-collector",
+                "esp-now-fast-source",
+                "esp-now-simplex-peer",
+                "esp-now-simplex-source",
+            ]
         );
+        for mode in WIFI_MODES {
+            assert!(
+                wifi(mode, None, None)
+                    .to_cli_command(None, &StandardCsiProfile)
+                    .is_ok(),
+                "base mode {mode} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn wifi_accepts_every_esp_now_mode() {
+        // This test previously asserted the opposite, on the belief that the firmware had dropped
+        // ESP-NOW. It had not: the crate and the CLI shipped those four modes throughout, so this
+        // API was rejecting `set-wifi --mode=` values a user could select on the console.
+        //
+        // Both simplex spellings are accepted. `-fast-` is what the firmware has always taken;
+        // `-simplex-` matches the node model, where the end that floods is the central.
+        for mode in [
+            "esp-now-central",
+            "esp-now-peripheral",
+            "esp-now-fast-collector",
+            "esp-now-fast-source",
+            "esp-now-simplex-peer",
+            "esp-now-simplex-source",
+        ] {
+            assert!(
+                wifi(mode, None, None)
+                    .to_cli_command(None, &StandardCsiProfile)
+                    .is_ok(),
+                "mode {mode} must be accepted"
+            );
+        }
     }
 
     #[test]
     fn wifi_rejects_unknown_mode() {
         assert!(wifi("mesh", None, None).to_cli_command(None, &StandardCsiProfile).is_err());
+        // "collector" names the RX role, not a mode the firmware accepts.
+        assert!(wifi("collector", None, None)
+            .to_cli_command(None, &StandardCsiProfile)
+            .is_err());
     }
 
-    /// A profile that names an extra wifi mode, standing in for an out-of-tree
-    /// capability crate. The open core must accept the mode and re-emit any
-    /// unknown `extra` params generically, without naming either itself.
+    /// A profile that names an extra pair of modes, standing in for an out-of-tree capability
+    /// crate. This crate must accept both and re-emit any unknown `extra` params generically,
+    /// without naming either itself.
     struct ExtraModeProfile;
     impl CsiProfile for ExtraModeProfile {
         fn extra_wifi_modes(&self) -> &'static [&'static str] {
-            &["custom-mode"]
+            &["custom-emitter", "custom-collector"]
         }
     }
 
     #[test]
-    fn wifi_accepts_profile_mode_and_emits_extra_params() {
-        let mut cfg = wifi("custom-mode", None, None);
+    fn wifi_accepts_profile_modes_and_emits_extra_params() {
+        let mut cfg = wifi("custom-emitter", None, None);
         cfg.extra
             .insert("inject-period-ms".to_string(), serde_json::json!(20));
         let cmd = cfg.to_cli_command(None, &ExtraModeProfile).unwrap();
         assert_eq!(
             cmd,
-            "set-wifi --mode=custom-mode --set-channel=1 --inject-period-ms=20"
+            "set-wifi --mode=custom-emitter --set-channel=1 --inject-period-ms=20"
         );
-        // The standard (no-op) profile does not name the mode, so it is rejected.
-        assert!(wifi("custom-mode", None, None)
-            .to_cli_command(None, &StandardCsiProfile)
-            .is_err());
+        for mode in ExtraModeProfile.extra_wifi_modes() {
+            // The seam carries every mode it names …
+            assert!(wifi(mode, None, None)
+                .to_cli_command(None, &ExtraModeProfile)
+                .is_ok());
+            // … and none of them leaks into the open base table.
+            assert!(!WIFI_MODES.contains(mode));
+            assert!(wifi(mode, None, None)
+                .to_cli_command(None, &StandardCsiProfile)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn wifi_error_lists_base_table_and_profile_modes() {
+        let err = wifi("mesh", None, None)
+            .to_cli_command(None, &ExtraModeProfile)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "Unknown wifi mode 'mesh'; expected one of: station, sniffer, \
+             wifi-ap, ht20-emitter, ht40-emitter, esp-now-central, \
+             esp-now-peripheral, esp-now-fast-collector, esp-now-fast-source, \
+             esp-now-simplex-peer, esp-now-simplex-source, custom-emitter, \
+             custom-collector"
+        );
     }
 
     /// A `CsiConfig` with every named flag unset and an empty `extra` map.
@@ -1187,6 +1394,39 @@ mod tests {
         cfg.extra
             .insert("preset".to_string(), serde_json::json!("turbo"));
         assert!(cfg.to_cli_command(&StandardCsiProfile).is_err());
+    }
+
+    #[test]
+    fn csi_output_emits_enabled_boolean() {
+        assert_eq!(
+            CsiOutputConfig { enabled: true }.to_cli_command(),
+            "set-csi-output --enabled=true"
+        );
+        assert_eq!(
+            CsiOutputConfig { enabled: false }.to_cli_command(),
+            "set-csi-output --enabled=false"
+        );
+    }
+
+    #[test]
+    fn csi_output_rejects_the_retired_collection_mode_body() {
+        let cfg: CsiOutputConfig = serde_json::from_str(r#"{"enabled":false}"#).unwrap();
+        assert!(!cfg.enabled);
+        // `{"mode":"collector"}` was the old body shape. It must fail to
+        // deserialize rather than be silently accepted as some default.
+        assert!(serde_json::from_str::<CsiOutputConfig>(r#"{"mode":"collector"}"#).is_err());
+        assert!(serde_json::from_str::<CsiOutputConfig>(r#"{"mode":"listener"}"#).is_err());
+    }
+
+    #[test]
+    fn firmware_defaults_capture_and_deliver() {
+        let defaults = DeviceConfig::firmware_defaults();
+        // The default node is a collector on the promiscuous capture path …
+        assert_eq!(defaults.wifi.mode.as_deref(), Some("sniffer"));
+        assert!(WIFI_MODES.contains(&defaults.wifi.mode.as_deref().unwrap()));
+        // … delivering what it captures, with no unicast injection destination.
+        assert_eq!(defaults.collection.csi_output_enabled, Some(true));
+        assert_eq!(defaults.wifi.peer_mac.as_deref(), Some("broadcast"));
     }
 
     #[test]

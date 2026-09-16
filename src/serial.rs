@@ -156,6 +156,35 @@ pub fn spawn_device(spec: &DeviceAttachSpec, profile: Arc<dyn CsiProfile>) -> Ar
 
 /// The receiver ends of a [`DeviceHandle`]'s channels that an EXTERNAL driver (instead of the local
 /// serial task) must service. Returned by [`spawn_external_device`].
+/// The port a board with this USB serial number is on RIGHT NOW, if it is present.
+///
+/// Espressif's native USB-Serial-JTAG reports the board MAC as its USB serial number, so this is a
+/// stable identity across re-enumeration where the `/dev` path explicitly is not. Comparison is
+/// case-insensitive and separator-insensitive because the two sources disagree on formatting: udev
+/// yields `10:BD:A3:CA:34:98` while device ids elsewhere use `10-BD-A3-CA-34-98`.
+fn normalize_serial(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_uppercase())
+        .collect()
+}
+
+fn resolve_port_by_serial(mac: &str) -> Option<String> {
+    let norm = normalize_serial;
+    let want = norm(mac);
+    if want.is_empty() {
+        return None;
+    }
+    tokio_serial::available_ports().ok()?.into_iter().find_map(|p| match &p.port_type {
+        tokio_serial::SerialPortType::UsbPort(info)
+            if info.serial_number.as_deref().map(norm).as_deref() == Some(want.as_str()) =>
+        {
+            Some(p.port_name)
+        }
+        _ => None,
+    })
+}
+
 pub struct ExternalDeviceChannels {
     /// CLI command strings the handle's `cmd_tx` accepts — forward these to wherever the board is.
     pub cmd_rx: mpsc::Receiver<String>,
@@ -226,13 +255,38 @@ pub async fn run_serial_task(
     mut session_file_rx: watch::Receiver<Option<String>>,
     mut info_request_rx: mpsc::Receiver<InfoResponder>,
 ) {
-    let port_path = dev.port_path.clone();
+    let mut port_path = dev.port_path.clone();
     let baud = dev.baud_rate;
     const RECONNECT_DELAY: Duration = Duration::from_millis(800);
 
     loop {
         if dev.shutdown.is_cancelled() {
             break;
+        }
+
+        // Follow the board if the kernel moved it.
+        //
+        // A native USB-Serial-JTAG part (ESP32-C5/C6, native-USB S3) RE-ENUMERATES whenever it
+        // resets — which is every flash, and every USB fault on the bus. The kernel then hands it
+        // the next free `ttyACMn`, which is frequently NOT the one it had. This task used to retry
+        // `dev.port_path` forever and log "No such file or directory" until someone replugged it, so
+        // a board that flashed perfectly well never came back and looked like a flash failure.
+        //
+        // Re-resolving by the USB serial number rather than by "find any ESP" is what keeps the
+        // original anti-race property: for an Espressif native-USB part the serial number IS the
+        // board's MAC, so it identifies exactly one physical device and two tasks can never converge
+        // on the same port. A bridge (CP210x/CH340) does not re-enumerate on chip reset and usually
+        // has no unique serial, so it keeps its path — hence this only moves when it can prove where.
+        if let Some(mac) = dev.mac.as_deref() {
+            if let Some(found) = resolve_port_by_serial(mac) {
+                if found != port_path {
+                    tracing::info!(
+                        "{} moved {} -> {} (re-enumerated); following it",
+                        mac, port_path, found
+                    );
+                    port_path = found;
+                }
+            }
         }
 
         let mut stream = match tokio_serial::new(&port_path, baud).open_native_async() {
@@ -379,6 +433,32 @@ impl ChipInfo {
     }
 }
 
+/// Whether a delimited frame is a firmware log line rather than a CSI packet.
+///
+/// In `Serialized` mode the console and the CSI stream share one link, so the
+/// firmware brackets each log line with COBS delimiters to keep it out of a packet
+/// (`esp-csi-rs::logging::write_text_framed`). It then arrives here as a frame of
+/// its own, and has to be told apart from a packet.
+///
+/// COBS output is arbitrary bytes, so this cannot be decided by parsing — it is
+/// decided by what a packet never looks like. A postcard `CSIDataPacket` is hundreds
+/// of bytes of binary and its COBS encoding is dense in high and control bytes; a log
+/// line is short, printable ASCII. Requiring every byte to be printable (plus
+/// CR/LF/tab) means a false positive needs an entire packet that happens to be ASCII,
+/// which the subcarrier payload alone rules out.
+fn is_text_frame(frame: &[u8]) -> bool {
+    !frame.is_empty()
+        && frame.len() <= TEXT_FRAME_MAX_LEN
+        && frame
+            .iter()
+            .all(|b| matches!(b, 0x20..=0x7e | b'\r' | b'\n' | b'\t'))
+}
+
+/// Upper bound on a firmware log line, matching the `heapless::String<256>` the
+/// firmware's log channel carries. A CSI frame is far longer, so the length alone
+/// separates most of them.
+const TEXT_FRAME_MAX_LEN: usize = 256;
+
 async fn run_serial_connection(
     dev: &DeviceHandle,
     stream: tokio_serial::SerialStream,
@@ -423,6 +503,15 @@ async fn run_serial_connection(
                 info.banner_version,
                 info.chip.as_deref().unwrap_or("unknown chip"),
             );
+            if !info.protocol_supported() {
+                // The core stays permissive (single-device, operator-driven);
+                // fleet hosts read `DeviceInfo.protocol` and enforce.
+                tracing::warn!(
+                    "Firmware speaks CLI protocol {:?}; this host targets {} — composed commands may misparse, reflash advised",
+                    info.protocol,
+                    crate::models::SUPPORTED_CLI_PROTOCOL,
+                );
+            }
             chip = ChipInfo::from_info(&info);
             firmware_verified.store(true, Ordering::SeqCst);
             *device_info.lock().await = Some(info);
@@ -566,6 +655,13 @@ async fn run_serial_connection(
                             info.banner_version,
                             info.chip.as_deref().unwrap_or("unknown chip"),
                         );
+                        if !info.protocol_supported() {
+                            tracing::warn!(
+                                "Firmware speaks CLI protocol {:?}; this host targets {} — composed commands may misparse, reflash advised",
+                                info.protocol,
+                                crate::models::SUPPORTED_CLI_PROTOCOL,
+                            );
+                        }
                         chip = ChipInfo::from_info(&info);
                         firmware_verified.store(true, Ordering::SeqCst);
                         *device_info.lock().await = Some(info);
@@ -653,6 +749,21 @@ async fn run_serial_connection(
                 }
             }
 
+            // ## KNOWN DEFECT, recorded here because this is where it is caused
+            //
+            // `read_until` is documented as **not cancellation-safe**: "if the method is used as an
+            // event in a `tokio::select!` statement and some other branch completes first, then some
+            // data may have been partially read". It is exactly that here, and `buf` is reused across
+            // iterations — so when a sibling arm fires mid-frame, the partial bytes remain in `buf` and
+            // the next `read_until` APPENDS the following frame onto them. The consumer then sees one
+            // buffer holding the tail of frame N followed by all of frame N+1, COBS deframing fails,
+            // and that frame is dropped (`csi-device-pool::device` logs it and counts `undecodable`).
+            //
+            // Impact is one lost frame per occurrence, not a stalled stream: the next delimiter resyncs.
+            // The fix is to stop framing inside the `select!` — read with a cancel-safe primitive
+            // (`AsyncReadExt::read` into a scratch buffer) and split on `DELIMITER` here — which is a
+            // change to the hot ingest path for every device and wants its own hardware pass rather
+            // than riding along with unrelated fixes.
             result = reader.read_until(DELIMITER, &mut buf) => {
                 match result {
                     Ok(0) => {
@@ -683,6 +794,23 @@ async fn run_serial_connection(
                         // leaking them. The buffer is still cleared below so the
                         // framer keeps draining serial input.
                         let still_collecting = collection_running.load(Ordering::SeqCst);
+
+                        // A frame the firmware deliberately filled with text, not a
+                        // packet. In `Serialized` mode the console and the CSI stream
+                        // are the same link, so the firmware brackets every log line
+                        // with delimiters to keep it out of a packet; it arrives here
+                        // as its own frame. Counting it as a CSI frame would inflate
+                        // `frames_in`, and decoding it would raise a decode error for
+                        // something that is not a wire mismatch — which is what makes
+                        // the real ones worth reading.
+                        if still_collecting && is_text_frame(&buf) {
+                            tracing::info!(
+                                "{port_path} firmware: {}",
+                                String::from_utf8_lossy(&buf).trim_end()
+                            );
+                            buf.clear();
+                            continue;
+                        }
 
                         if still_collecting && !buf.is_empty() {
                             frames_in += 1;
@@ -1140,6 +1268,63 @@ fn sync_parquet_sink(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A firmware log line is recognised, so it is reported rather than counted as a
+    /// decode error — and, more to the point, the packet that used to be swallowed
+    /// alongside it survives.
+    #[test]
+    fn framed_log_line_is_text() {
+        assert!(is_text_frame(b"he20-stats rx=1744 drop=0 logdrop=0\r\n"));
+        assert!(is_text_frame(b"esp-now version 20"));
+    }
+
+    /// A real COBS-framed packet must never be mistaken for one. Encoded CSI carries
+    /// signed subcarrier amplitudes, so high bytes appear almost immediately.
+    #[test]
+    fn cobs_packet_is_not_text() {
+        let pkt = crate::csi::PacketBc5 {
+            mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x05],
+            rssi: -61, timestamp: 123456, rate: 1, noise_floor: -92, sig_len: 80,
+            rx_state: 0, dump_len: 384, cur_bb_format: 2, rx_channel_estimate_info_vld: 1,
+            rx_channel_estimate_len: 384, second: 7, channel: 149, is_group: 0,
+            rxend_state: 0, rxmatch3: 0, rxmatch2: 0, rxmatch1: 1, date_time: None,
+            sequence_number: 99, csi_data_len: 8,
+            data_format: crate::csi::RxCsiFmt::Undefined,
+            csi_data: vec![1, -2, 3, -4, 120, -119, 90, -91],
+        };
+        let mut buf = vec![0u8; 4096];
+        let cobs = postcard::to_slice_cobs(&pkt, &mut buf).unwrap();
+        let body = cobs.strip_suffix(&[0]).unwrap_or(cobs);
+        assert!(!is_text_frame(body));
+    }
+
+    /// The empty frame the leading delimiter produces is not text either; the framer
+    /// drops it on the existing `!buf.is_empty()` guard.
+    #[test]
+    fn empty_frame_is_not_text() {
+        assert!(!is_text_frame(b""));
+    }
+    use super::normalize_serial;
+
+    /// udev and our device ids format a MAC differently; matching must not care.
+    ///
+    /// This is the whole correctness of following a re-enumerated board: udev reports
+    /// `10:BD:A3:CA:34:98` as the USB serial while device ids elsewhere use `10-BD-A3-CA-34-98`. A
+    /// literal comparison never matches, the board is never found at its new path, and the fix
+    /// silently does nothing — which is worse than not having it, because the logs would claim it
+    /// looked.
+    #[test]
+    fn serial_matching_ignores_case_and_separators() {
+        let a = normalize_serial("10:BD:A3:CA:34:98");
+        assert_eq!(a, normalize_serial("10-BD-A3-CA-34-98"));
+        assert_eq!(a, normalize_serial("10bda3ca3498"));
+        assert_eq!(a, "10BDA3CA3498");
+        // Distinct boards must not collide.
+        assert_ne!(a, normalize_serial("10:BD:A3:CE:E5:B0"));
+        // An empty or punctuation-only serial must not match everything.
+        assert_eq!(normalize_serial(":::"), "");
+    }
     use super::detect_boot_fault;
 
     /// The exact banner an ESP32-C5 spews when wedged in the USB-JTAG reset

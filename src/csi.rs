@@ -10,10 +10,14 @@
 //! `esp-csi-rs` is an `esp-hal` crate and cannot compile for a Linux host, so
 //! the wire types are re-declared here. postcard is **not** self-describing and
 //! uses varint encoding, so these mirrors must match the firmware field-for-
-//! field, in order. **Matched to `esp-csi-rs-core` 0.1.x** (the C5/C6
-//! `CSIDataPacket` layout, incl. HE20 frames carrying `cur_bb_format` 4/5 with
-//! `data_format = Undefined`). When the firmware bumps its protocol/struct,
-//! update these definitions in lockstep.
+//! field, in order. **Matched to `esp-csi-rs` 0.11** (the C5/C6 `CSIDataPacket`
+//! layout). That includes frames whose `data_format` this crate reports as
+//! `Undefined`: the layout is the same whatever produced them, so they decode
+//! structurally, but naming a format this crate does not implement is not its
+//! job — the label comes from
+//! [`CsiProfile::label_format`](crate::profile::CsiProfile::label_format).
+//! When the firmware bumps its protocol/struct, update these definitions in
+//! lockstep.
 //!
 //! ## Chip layouts
 //! The on-device `CSIDataPacket` has two shapes selected by `#[cfg]`:
@@ -71,7 +75,10 @@ pub struct DateTime {
 /// Mirror of `esp_csi_rs::csi::RxCSIFmt` — **variant order is the wire encoding**
 /// (postcard encodes the discriminant as a varint of the declaration index), so
 /// do not reorder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `Default` is `Undefined`, and the attribute is on that variant rather than reordering anything:
+// variant order IS the wire encoding (postcard encodes the discriminant as a varint of the
+// declaration index), so `#[default]` marks the existing variant in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RxCsiFmt {
     Bw20,
     HtBw20,
@@ -92,6 +99,7 @@ pub enum RxCsiFmt {
     /// firmware leaves unlabelled). The raw `cur_bb_format` is preserved on the
     /// decoded record, so an embedder's
     /// [`CsiProfile`](crate::profile::CsiProfile) can label it downstream.
+    #[default]
     Undefined,
 }
 
@@ -217,7 +225,7 @@ pub struct PacketBc6 {
 /// Fields absent on the source chip are `None`. This is what the Parquet sink
 /// consumes; its column set is the union of all chip layouts plus the
 /// host-supplied receive time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DecodedCsi {
     // ── Common to every layout ──────────────────────────────────────────
     pub mac: [u8; 6],
@@ -399,6 +407,112 @@ impl From<PacketBc6> for DecodedCsi {
             rxmatch0: Some(p.rxmatch0),
         }
     }
+}
+
+/// Parse one `array-list` line into the same record the binary path produces.
+///
+/// ## Why this exists
+///
+/// `serialized` mode puts raw COBS on the wire on a text build and wraps the identical frame in
+/// `defmt::println!("{=[u8]}")` on a defmt build, so a defmt board cannot use it — the bytes arrive
+/// inside a defmt frame and the postcard decoder discards them. `array-list` is the compact form
+/// that survives, because it is a complete ASCII line per packet. It is therefore the mode the pool
+/// asks a defmt board for (`Pool::log_mode_for`), and this is what reads it.
+///
+/// ## Layout
+///
+/// The firmware writes `[seq,rssi,rate,noise_floor,channel,timestamp,sig_len,rx_state,` then a
+/// chip-specific run of diagnostic counters, then `sig_len,csi_data_len,[i0,q0,…]]`.
+///
+/// Parsed WITHOUT a per-chip position table, deliberately. The first eight fields are common to
+/// every layout, and `csi_data_len` is always the last header field before the payload — so the
+/// values that matter are addressable from the two ends, and the chip-specific middle (which is
+/// diagnostics) is skipped rather than guessed. A table indexed by chip would be a second place for
+/// the layout to be wrong, and it would go stale the next time a field is added for one part.
+///
+/// ## Transmission identity
+///
+/// Both halves of it survive. `frame_seq` is the leading `sequence_number` field — the pool maps
+/// `frame_seq: Some(decoded.sequence_number)` — and `mac` arrives in the tail the firmware appends
+/// after the payload. So an array-list capture can be joined on `(mac, frame_seq)`, the same key the
+/// binary path uses, and nothing is lost for phase sync.
+///
+/// A line with no tail (an older build, mid-rollout) yields a zeroed `mac`, which degrades that
+/// capture to arrival-time pairing rather than discarding it. Zeroed rather than invented: a
+/// fabricated identity would let the join pair packets that were never the same transmission.
+/// `aa:bb:cc:dd:ee:ff` → six bytes. `None` for anything else, including an empty tail.
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut parts = s.split(':');
+    for slot in out.iter_mut() {
+        *slot = u8::from_str_radix(parts.next()?.trim(), 16).ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(out)
+}
+
+pub fn decode_array_list(line: &str) -> Option<DecodedCsi> {
+    let line = line.trim();
+    let body = line.strip_prefix('[')?.strip_suffix(']')?;
+    // The payload array is the tail; the header is everything before it.
+    let open = body.rfind('[')?;
+    let header = body[..open].trim_end_matches(',');
+    // The payload array, then whatever identity tail follows it.
+    //
+    // The firmware appends `,<mac>` after the payload's `]` so the header's per-chip field positions
+    // stay put — see `format_array_list_into`. Split at the payload's own close rather than the end
+    // of the line, and treat a missing tail as a line from an older build rather than a malformed
+    // one: a fleet runs mixed firmware during a rollout, and refusing those would drop real captures.
+    let rest = &body[open + 1..];
+    let close = rest.find(']')?;
+    let payload = &rest[..close];
+    let tail = rest[close + 1..].trim_start_matches(',').trim();
+
+    let nums: Vec<i64> = header
+        .split(',')
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(|f| f.parse::<i64>().ok())
+        .collect::<Option<_>>()?;
+    // Eight common fields plus the trailing `sig_len,csi_data_len` pair is the shortest a line can
+    // legitimately be; anything shorter is a truncated line, not a layout this does not know.
+    if nums.len() < 10 {
+        return None;
+    }
+
+    let csi_data: Vec<i8> = if payload.trim().is_empty() {
+        Vec::new()
+    } else {
+        payload
+            .split(',')
+            .map(|v| v.trim().parse::<i8>().ok())
+            .collect::<Option<_>>()?
+    };
+    // The firmware's own count, and it must agree with what arrived. A line cut short by a serial
+    // read that raced the writer would otherwise become a short frame that looks complete.
+    let claimed = *nums.last()? as usize;
+    if claimed != csi_data.len() {
+        return None;
+    }
+
+    Some(DecodedCsi {
+        mac: parse_mac(tail).unwrap_or([0u8; 6]),
+        sequence_number: nums[0] as u16,
+        rssi: nums[1] as i32,
+        rate: nums[2] as u32,
+        noise_floor: nums[3] as i32,
+        channel: nums[4] as u32,
+        timestamp: nums[5] as u32,
+        sig_len: nums[6] as u32,
+        rx_state: nums[7] as u32,
+        csi_data_len: claimed as u16,
+        csi_data,
+        // Everything else the line does not carry stays absent rather than defaulted to a value that
+        // would read as a measurement.
+        ..Default::default()
+    })
 }
 
 /// Failure decoding a serialized CSI frame.
@@ -583,5 +697,100 @@ mod tests {
         assert_eq!(ChipVariant::from_chip_str("esp32c6"), Some(ChipVariant::Esp32c6));
         assert_eq!(ChipVariant::from_chip_str("esp32c5"), Some(ChipVariant::Esp32c5));
         assert_eq!(ChipVariant::from_chip_str("weird"), None);
+    }
+}
+
+#[cfg(test)]
+mod array_list_tests {
+    use super::*;
+
+    /// A real C5 line, parsed from both ends rather than by a per-chip position table.
+    #[test]
+    fn a_c5_array_list_line_yields_the_fields_it_carries() {
+        // seq,rssi,rate,noise_floor,channel,timestamp,sig_len,rx_state, <c5 diagnostics…>,
+        // sig_len,csi_data_len,[payload]
+        let line = "[7,-42,11,-96,149,123456,120,0,384,4,1,384,9,149,120,6,[1,-2,3,-4,5,-6]]\r\n";
+        let d = decode_array_list(line).expect("a well-formed line");
+        assert_eq!(d.sequence_number, 7);
+        assert_eq!(d.rssi, -42);
+        assert_eq!(d.rate, 11);
+        assert_eq!(d.noise_floor, -96);
+        assert_eq!(d.channel, 149);
+        assert_eq!(d.timestamp, 123456);
+        assert_eq!(d.csi_data_len, 6);
+        assert_eq!(d.csi_data, vec![1, -2, 3, -4, 5, -6]);
+        // No tail on this line, so identity degrades rather than being invented.
+        assert_eq!(d.mac, [0u8; 6]);
+    }
+
+    /// A longer chip layout parses with no change, because nothing indexes the middle.
+    #[test]
+    fn a_wider_layout_parses_without_a_per_chip_table() {
+        let line = "[1,-50,7,-95,6,99,64,0,1,2,3,4,5,6,7,8,9,10,64,4,[9,8,7,6]]";
+        let d = decode_array_list(line).expect("a wider header is still readable");
+        assert_eq!((d.sequence_number, d.channel, d.csi_data_len), (1, 6, 4));
+        assert_eq!(d.csi_data, vec![9, 8, 7, 6]);
+    }
+
+    /// A line cut short by a read that raced the writer is rejected, not silently shortened.
+    ///
+    /// This is the failure mode that matters: the pool's serial read is not cancellation-safe and
+    /// splices partial frames (the COBS path logs exactly that). A truncated payload that still
+    /// parsed would become a short frame indistinguishable from a complete one.
+    #[test]
+    fn a_truncated_payload_is_refused_because_the_count_disagrees() {
+        let full = "[7,-42,11,-96,149,123456,120,0,384,4,1,384,9,149,120,6,[1,-2,3,-4,5,-6]]";
+        assert!(decode_array_list(full).is_some());
+        let cut = "[7,-42,11,-96,149,123456,120,0,384,4,1,384,9,149,120,6,[1,-2,3]]";
+        assert!(
+            decode_array_list(cut).is_none(),
+            "the firmware's own csi_data_len must agree with what arrived"
+        );
+    }
+
+    /// Not-a-line, and a header too short to be any layout, are refused.
+    #[test]
+    fn malformed_input_is_refused() {
+        assert!(decode_array_list("").is_none());
+        assert!(decode_array_list("stats rx=49").is_none());
+        assert!(decode_array_list("[1,2,3,[1,2]]").is_none(), "header too short");
+        assert!(decode_array_list("[1,2,3,4,5,6,7,8,9,2,[1,x]]").is_none(), "non-numeric payload");
+        // An empty payload with a matching count is legitimate: a metadata-only packet.
+        assert!(decode_array_list("[1,2,3,4,5,6,7,8,9,0,[]]").is_some());
+    }
+
+    /// The identity tail is read, so an array-list capture joins on `(mac, frame_seq)` like the
+    /// binary path — nothing is lost for phase sync.
+    #[test]
+    fn the_identity_tail_carries_mac_and_frame_seq_survives_as_field_zero() {
+        let line = "[7,-42,11,-96,149,123456,120,0,384,4,1,384,9,149,120,6,\
+                    [1,-2,3,-4,5,-6],10:bd:a3:ce:e5:b0]";
+        let d = decode_array_list(line).expect("a line with an identity tail");
+        assert_eq!(d.mac, [0x10, 0xbd, 0xa3, 0xce, 0xe5, 0xb0]);
+        // `frame_seq` is this field: the pool maps `frame_seq: Some(decoded.sequence_number)`.
+        assert_eq!(d.sequence_number, 7);
+        assert_eq!(d.csi_data, vec![1, -2, 3, -4, 5, -6]);
+    }
+
+    /// A line from a build that predates the tail still parses — a fleet runs mixed firmware during
+    /// a rollout, and refusing those would drop real captures.
+    #[test]
+    fn a_line_without_a_tail_still_parses_with_a_zeroed_mac() {
+        let line = "[7,-42,11,-96,149,123456,120,0,384,4,1,384,9,149,120,6,[1,-2,3,-4,5,-6]]";
+        let d = decode_array_list(line).expect("an older line is still readable");
+        assert_eq!(d.mac, [0u8; 6]);
+        assert_eq!(d.sequence_number, 7);
+    }
+
+    /// A malformed tail is not a fabricated identity.
+    #[test]
+    fn a_bad_mac_tail_degrades_rather_than_inventing_one() {
+        for tail in ["zz:bd:a3:ce:e5:b0", "10:bd:a3", "10:bd:a3:ce:e5:b0:99"] {
+            let line = format!(
+                "[7,-42,11,-96,149,123456,120,0,384,4,1,384,9,149,120,2,[1,-2],{tail}]"
+            );
+            let d = decode_array_list(&line).expect("the frame itself is still good");
+            assert_eq!(d.mac, [0u8; 6], "tail {tail:?} must not become an identity");
+        }
     }
 }

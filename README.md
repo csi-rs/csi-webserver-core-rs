@@ -21,6 +21,37 @@ For the ready-to-run executable, see [`csi-webserver`](https://github.com/csi-rs
 - USB hotplug supervisor ([`supervisor`](src/supervisor.rs))
 - Explicit device registration ([`DeviceRegistry::attach`](src/state.rs))
 
+## Node modes
+
+`POST /api/config/wifi` mirrors the firmware's `set-wifi --mode=` grammar. Each value names one
+**operational mode** — how a node reaches the channel. The other three attributes that describe a
+node (network role, collection mode, session role) are not set here: each mode carries only the
+ones it admits.
+
+The model is documented once, in
+[`esp-csi-rs/docs/network-model.md`](https://github.com/csi-rs/esp-csi-rs/blob/main/docs/network-model.md).
+This crate validates against it and does not restate it.
+
+| Mode | Reaches the channel by |
+|---|---|
+| `station` | associating to an AP or a commercial router |
+| `sniffer` | promiscuous capture on a locked channel |
+| `wifi-ap` | a self-contained softAP with DHCP |
+| `ht20-emitter` / `ht40-emitter` | unassociated raw 802.11n injection, 20 or 40 MHz |
+| `esp-now-central` / `esp-now-peripheral` | the symmetric connectionless exchange |
+| `esp-now-fast-source` / `esp-now-fast-collector` | the asymmetric exchange; also spelled `esp-now-simplex-source` / `esp-now-simplex-peer` |
+
+Modes this crate does not name — chip-gated ones, or those supplied by a build it does not target —
+are added by an embedder through
+[`CsiProfile::extra_wifi_modes`](src/profile.rs); their mode-specific flags ride through the
+flattened `extra` map on the request body and re-emit verbatim as `--{key}={value}`, so this crate
+never names any of them.
+
+`POST /api/config/csi-output` (`{ "enabled": true|false }`) gates off-device delivery of captured
+CSI — capture and its RX timing are unchanged either way. It replaces the removed
+`POST /api/config/collection-mode`. Note that this had **no effect** on firmware before
+`esp-csi-rs` 0.11, which stored the flag without reading it.
+
 ## Quick embed
 
 ```toml
