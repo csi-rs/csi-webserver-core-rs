@@ -433,6 +433,32 @@ impl ChipInfo {
     }
 }
 
+/// Whether a delimited frame is a firmware log line rather than a CSI packet.
+///
+/// In `Serialized` mode the console and the CSI stream share one link, so the
+/// firmware brackets each log line with COBS delimiters to keep it out of a packet
+/// (`esp-csi-rs::logging::write_text_framed`). It then arrives here as a frame of
+/// its own, and has to be told apart from a packet.
+///
+/// COBS output is arbitrary bytes, so this cannot be decided by parsing — it is
+/// decided by what a packet never looks like. A postcard `CSIDataPacket` is hundreds
+/// of bytes of binary and its COBS encoding is dense in high and control bytes; a log
+/// line is short, printable ASCII. Requiring every byte to be printable (plus
+/// CR/LF/tab) means a false positive needs an entire packet that happens to be ASCII,
+/// which the subcarrier payload alone rules out.
+fn is_text_frame(frame: &[u8]) -> bool {
+    !frame.is_empty()
+        && frame.len() <= TEXT_FRAME_MAX_LEN
+        && frame
+            .iter()
+            .all(|b| matches!(b, 0x20..=0x7e | b'\r' | b'\n' | b'\t'))
+}
+
+/// Upper bound on a firmware log line, matching the `heapless::String<256>` the
+/// firmware's log channel carries. A CSI frame is far longer, so the length alone
+/// separates most of them.
+const TEXT_FRAME_MAX_LEN: usize = 256;
+
 async fn run_serial_connection(
     dev: &DeviceHandle,
     stream: tokio_serial::SerialStream,
@@ -768,6 +794,23 @@ async fn run_serial_connection(
                         // leaking them. The buffer is still cleared below so the
                         // framer keeps draining serial input.
                         let still_collecting = collection_running.load(Ordering::SeqCst);
+
+                        // A frame the firmware deliberately filled with text, not a
+                        // packet. In `Serialized` mode the console and the CSI stream
+                        // are the same link, so the firmware brackets every log line
+                        // with delimiters to keep it out of a packet; it arrives here
+                        // as its own frame. Counting it as a CSI frame would inflate
+                        // `frames_in`, and decoding it would raise a decode error for
+                        // something that is not a wire mismatch — which is what makes
+                        // the real ones worth reading.
+                        if still_collecting && is_text_frame(&buf) {
+                            tracing::info!(
+                                "{port_path} firmware: {}",
+                                String::from_utf8_lossy(&buf).trim_end()
+                            );
+                            buf.clear();
+                            continue;
+                        }
 
                         if still_collecting && !buf.is_empty() {
                             frames_in += 1;
@@ -1225,6 +1268,43 @@ fn sync_parquet_sink(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A firmware log line is recognised, so it is reported rather than counted as a
+    /// decode error — and, more to the point, the packet that used to be swallowed
+    /// alongside it survives.
+    #[test]
+    fn framed_log_line_is_text() {
+        assert!(is_text_frame(b"he20-stats rx=1744 drop=0 logdrop=0\r\n"));
+        assert!(is_text_frame(b"esp-now version 20"));
+    }
+
+    /// A real COBS-framed packet must never be mistaken for one. Encoded CSI carries
+    /// signed subcarrier amplitudes, so high bytes appear almost immediately.
+    #[test]
+    fn cobs_packet_is_not_text() {
+        let pkt = crate::csi::PacketBc5 {
+            mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x05],
+            rssi: -61, timestamp: 123456, rate: 1, noise_floor: -92, sig_len: 80,
+            rx_state: 0, dump_len: 384, cur_bb_format: 2, rx_channel_estimate_info_vld: 1,
+            rx_channel_estimate_len: 384, second: 7, channel: 149, is_group: 0,
+            rxend_state: 0, rxmatch3: 0, rxmatch2: 0, rxmatch1: 1, date_time: None,
+            sequence_number: 99, csi_data_len: 8,
+            data_format: crate::csi::RxCsiFmt::Undefined,
+            csi_data: vec![1, -2, 3, -4, 120, -119, 90, -91],
+        };
+        let mut buf = vec![0u8; 4096];
+        let cobs = postcard::to_slice_cobs(&pkt, &mut buf).unwrap();
+        let body = cobs.strip_suffix(&[0]).unwrap_or(cobs);
+        assert!(!is_text_frame(body));
+    }
+
+    /// The empty frame the leading delimiter produces is not text either; the framer
+    /// drops it on the existing `!buf.is_empty()` guard.
+    #[test]
+    fn empty_frame_is_not_text() {
+        assert!(!is_text_frame(b""));
+    }
     use super::normalize_serial;
 
     /// udev and our device ids format a MAC differently; matching must not care.
