@@ -1,7 +1,8 @@
 //! Parquet writer for decoded CSI sessions.
 //!
 //! Each collection session writes one Parquet file. Rows are buffered and
-//! flushed as row groups; the file footer is written on [`ParquetSink::close`].
+//! flushed as row groups; the file footer is written when the
+//! [`ParquetSink`] is dropped.
 //!
 //! ## Schema
 //! A single **superset** schema covers all chip layouts so consumers see one
@@ -12,7 +13,7 @@
 //! field, which is microseconds since the device's controller start.
 //!
 //! ## Durability
-//! Parquet is only readable once its footer is written by [`ParquetSink::close`].
+//! Parquet is only readable once its footer is written, when the sink is dropped.
 //! A clean session stop closes the file. An abrupt device unplug or crash leaves
 //! the in-progress file without a footer (and any unflushed rows lost) — that
 //! file will not open. This is an accepted limitation.
@@ -46,9 +47,8 @@ struct Row {
 
 /// Writes decoded CSI packets to a Parquet file for one session.
 ///
-/// The file footer is written by [`ParquetSink::close`] *or* automatically on
-/// drop (so a dropped sink — session end, device disconnect, shutdown — still
-/// produces a readable file). Only a hard crash/panic skips finalization.
+/// The file footer is written when the sink is dropped (so a dropped sink —
+/// session end, device disconnect, shutdown — still produces a readable file). Only a hard crash/panic skips finalization.
 pub struct ParquetSink {
     /// `None` once finalized; `Some` while open.
     writer: Option<ArrowWriter<File>>,

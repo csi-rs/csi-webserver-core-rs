@@ -1,7 +1,7 @@
 //! USB hotplug supervisor and port discovery.
 //!
 //! Polls attached ESP32 serial ports and registers or removes devices in the
-//! shared [`DeviceRegistry`](crate::state::DeviceRegistry).
+//! shared [`DeviceRegistry`].
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
