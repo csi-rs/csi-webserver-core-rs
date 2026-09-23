@@ -81,9 +81,10 @@ pub async fn set_wifi(
             cfg.wifi.ap_burst = Some(ap_burst);
         }
         if let Some(mac) = body.peer_mac {
-            // Empty clears the filter back to auto on the device; mirror that
-            // in the cache so the displayed value matches `show-config`.
-            cfg.wifi.peer_mac = Some(if mac.is_empty() { "auto".to_string() } else { mac });
+            // Empty clears the peer back to broadcast on the device; mirror
+            // that in the cache so the value matches `show-config` (`Dst MAC :
+            // broadcast`) and the reset defaults.
+            cfg.wifi.peer_mac = Some(if mac.is_empty() { "broadcast".to_string() } else { mac });
         }
         if let Some(ht40) = body.ht40 {
             // `off` is an alias for `none` on the device side.
