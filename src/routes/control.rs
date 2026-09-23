@@ -1,4 +1,4 @@
-//! Handlers for collection control endpoints under `/api/control/*`.
+//! Handlers for collection control endpoints under `/api/devices/{id}/control/*`.
 
 use axum::{Json, http::StatusCode};
 use chrono::Local;
@@ -20,7 +20,7 @@ const POST_RESET_BOOT_DELAY: Duration = Duration::from_millis(800);
 /// channel hop-on-hop-off latency.
 const POST_RESET_VERIFY_TIMEOUT: Duration = Duration::from_millis(3000);
 
-// ─── GET /api/control/status ──────────────────────────────────────────────
+// ─── GET /api/devices/{id}/control/status ─────────────────────────────────
 
 pub async fn get_collection_status(
     Device(dev): Device,
@@ -35,7 +35,7 @@ pub async fn get_collection_status(
     )
 }
 
-// ─── POST /api/control/reset ───────────────────────────────────────────────
+// ─── POST /api/devices/{id}/control/reset ──────────────────────────────────
 
 /// Reset the ESP32, then re-verify its firmware identity.
 ///
@@ -97,7 +97,7 @@ pub async fn reset_esp32(Device(dev): Device) -> (StatusCode, Json<ApiResponse>)
                 success: true,
                 message: "ESP32 restart issued via firmware (native USB-Serial-JTAG). The device \
                           will re-enumerate and re-verify automatically; poll GET /api/devices or \
-                          GET /api/info to confirm."
+                          GET /api/devices/{id}/info to confirm."
                     .to_string(),
             }),
         );
@@ -156,7 +156,7 @@ pub async fn reset_esp32(Device(dev): Device) -> (StatusCode, Json<ApiResponse>)
                 success: true,
                 message:
                     "ESP32 reset triggered via RTS, but post-reset re-verification could not be \
-                     queued (serial task is shutting down). Call GET /api/info to retry."
+                     queued (serial task is shutting down). Call GET /api/devices/{id}/info to retry."
                         .to_string(),
             }),
         );
@@ -189,7 +189,7 @@ pub async fn reset_esp32(Device(dev): Device) -> (StatusCode, Json<ApiResponse>)
             StatusCode::OK,
             Json(ApiResponse {
                 success: true,
-                message: "ESP32 reset; post-reset re-verification timed out. Call GET /api/info \
+                message: "ESP32 reset; post-reset re-verification timed out. Call GET /api/devices/{id}/info \
                           to retry."
                     .to_string(),
             }),
@@ -197,7 +197,7 @@ pub async fn reset_esp32(Device(dev): Device) -> (StatusCode, Json<ApiResponse>)
     }
 }
 
-// ─── POST /api/control/stop ────────────────────────────────────────────────
+// ─── POST /api/devices/{id}/control/stop ───────────────────────────────────
 
 /// Stop an in-progress collection by sending a `q` byte over the serial port.
 ///
@@ -252,7 +252,7 @@ pub async fn stop_collection(Device(dev): Device) -> (StatusCode, Json<ApiRespon
     }
 }
 
-// ─── POST /api/control/start ────────────────────────────────────────────────
+// ─── POST /api/devices/{id}/control/start ───────────────────────────────────
 ///
 /// Body (all fields optional):
 /// ```json

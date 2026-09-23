@@ -1,4 +1,4 @@
-//! Handlers for configuration endpoints under `/api/config/*`.
+//! Handlers for configuration endpoints under `/api/devices/{id}/config/*`.
 
 use axum::{Json, http::StatusCode};
 use std::sync::atomic::Ordering;
@@ -13,7 +13,7 @@ use crate::{
     state::DeviceHandle,
 };
 
-// ─── GET /api/config ────────────────────────────────────────────────────────
+// ─── GET /api/devices/{id}/config ───────────────────────────────────────────
 
 /// Return the server-side cached device configuration as JSON.
 pub async fn get_config(Device(dev): Device) -> Json<DeviceConfig> {
@@ -21,7 +21,7 @@ pub async fn get_config(Device(dev): Device) -> Json<DeviceConfig> {
     Json(config.clone())
 }
 
-// ─── POST /api/config/reset ─────────────────────────────────────────────────
+// ─── POST /api/devices/{id}/config/reset ────────────────────────────────────
 
 pub async fn reset_config(Device(dev): Device) -> (StatusCode, Json<ApiResponse>) {
     let result = send_cmd(&dev, "reset-config".to_string()).await;
@@ -32,8 +32,11 @@ pub async fn reset_config(Device(dev): Device) -> (StatusCode, Json<ApiResponse>
     result
 }
 
-// ─── POST /api/config/wifi ──────────────────────────────────────────────────
+// ─── POST /api/devices/{id}/config/wifi ─────────────────────────────────────
 
+/// Forward `set-wifi`. Returns `400` when the body fails validation — among
+/// other cases, when `collection` is sent with a mode whose collection mode is
+/// fixed (see [`FIXED_COLLECTION_MODES`](crate::models::FIXED_COLLECTION_MODES)).
 pub async fn set_wifi(
     Device(dev): Device,
     Json(body): Json<WifiConfig>,
@@ -78,20 +81,24 @@ pub async fn set_wifi(
             cfg.wifi.ap_burst = Some(ap_burst);
         }
         if let Some(mac) = body.peer_mac {
-            // Empty clears the filter back to auto on the device; mirror that
-            // in the cache so the displayed value matches `show-config`.
-            cfg.wifi.peer_mac = Some(if mac.is_empty() { "auto".to_string() } else { mac });
+            // Empty clears the peer back to broadcast on the device; mirror
+            // that in the cache so the value matches `show-config` (`Dst MAC :
+            // broadcast`) and the reset defaults.
+            cfg.wifi.peer_mac = Some(if mac.is_empty() { "broadcast".to_string() } else { mac });
         }
         if let Some(ht40) = body.ht40 {
             // `off` is an alias for `none` on the device side.
             cfg.wifi.ht40 = Some(if ht40 == "off" { "none".to_string() } else { ht40 });
+        }
+        if let Some(collection) = body.collection {
+            cfg.wifi.collection = Some(collection);
         }
         // sta_password is intentionally not cached.
     }
     result
 }
 
-// ─── POST /api/config/traffic ───────────────────────────────────────────────
+// ─── POST /api/devices/{id}/config/traffic ──────────────────────────────────
 
 pub async fn set_traffic(
     Device(dev): Device,
@@ -111,7 +118,7 @@ pub async fn set_traffic(
     result
 }
 
-// ─── POST /api/config/csi ───────────────────────────────────────────────────
+// ─── POST /api/devices/{id}/config/csi ──────────────────────────────────────
 
 pub async fn set_csi(
     Device(dev): Device,
@@ -128,7 +135,7 @@ pub async fn set_csi(
     result
 }
 
-// ─── POST /api/config/csi-output ───────────────────────────────────────────
+// ─── POST /api/devices/{id}/config/csi-output ──────────────────────────────
 
 /// Gate off-device delivery of captured CSI (`{ "enabled": true|false }`).
 /// The device keeps capturing with delivery off, so the RX path and its timing
@@ -144,20 +151,20 @@ pub async fn set_csi_output(
     result
 }
 
-// ─── POST /api/config/output-mode ───────────────────────────────────────────
+// ─── POST /api/devices/{id}/config/output-mode ──────────────────────────────
 
 /// Switch the server's CSI output mode at runtime.
 ///
 /// Body:
 /// ```json
 /// { "mode": "stream" }   // default — broadcast via WebSocket
-/// { "mode": "dump" }     // write to session dump file; /api/ws returns 403
+/// { "mode": "dump" }     // write to session dump file; /api/devices/{id}/ws returns 403
 /// { "mode": "both" }     // write to file AND broadcast
 /// ```
 ///
 /// The change takes effect for the very next CSI frame received from the
 /// serial port. If no session has been started yet the dump destination will
-/// be set as soon as `POST /api/control/start` is called.
+/// be set as soon as `POST /api/devices/{id}/control/start` is called.
 pub async fn set_output_mode(
     Device(dev): Device,
     Json(body): Json<OutputModeConfig>,
@@ -182,10 +189,10 @@ pub async fn set_output_mode(
     )
 }
 
-// ─── POST /api/config/rate ──────────────────────────────────────────────────
+// ─── POST /api/devices/{id}/config/rate ─────────────────────────────────────
 
-/// Pin the Wi-Fi PHY rate (honored by all modes except `station` on the
-/// firmware side; `station` derives its rate from the associated AP).
+/// Set the Wi-Fi PHY rate. Reporting only, except on the ESP-NOW pair
+/// (`esp-now-central` / `esp-now-peripheral`), which applies it.
 pub async fn set_rate(
     Device(dev): Device,
     Json(body): Json<RateConfig>,
@@ -198,7 +205,7 @@ pub async fn set_rate(
     result
 }
 
-// ─── POST /api/config/protocol ──────────────────────────────────────────────
+// ─── POST /api/devices/{id}/config/protocol ─────────────────────────────────
 
 /// Set the Wi-Fi PHY protocol applied at the start of each collection run.
 /// Forwards `set-protocol`. The setting is read at `start`, so change it
@@ -219,7 +226,7 @@ pub async fn set_protocol(
     result
 }
 
-// ─── POST /api/config/io-tasks ──────────────────────────────────────────────
+// ─── POST /api/devices/{id}/config/io-tasks ─────────────────────────────────
 
 /// Toggle per-direction TX/RX Embassy tasks. Either or both fields may be set;
 /// omitted fields preserve the current device-side value.
@@ -244,7 +251,7 @@ pub async fn set_io_tasks(
     result
 }
 
-// ─── POST /api/config/csi-delivery ──────────────────────────────────────────
+// ─── POST /api/devices/{id}/config/csi-delivery ─────────────────────────────
 
 /// Switch the CSI delivery path and/or toggle the inline log gate. Either or
 /// both fields may be set; omitted fields preserve the current device-side

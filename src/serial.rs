@@ -480,7 +480,7 @@ async fn run_serial_connection(
     // The chip just rebooted via the RTS pulse in run_serial_task. Give it
     // a moment to finish printing its boot banner, then ask `info` and
     // mirror the result into AppState. This is what makes command
-    // endpoints unblock without requiring the user to call /api/info first.
+    // endpoints unblock without requiring the user to call /api/devices/{id}/info first.
 
     // The chip identity (from the `info` block) selects the wire layout the
     // Parquet decoder uses; refreshed on every successful info exchange.
@@ -787,7 +787,7 @@ async fn run_serial_connection(
                         }
 
                         // Only forward to consumers while a session is active.
-                        // After `POST /api/control/stop` flips
+                        // After `POST /api/devices/{id}/control/stop` flips
                         // `collection_running` to false, this drops any
                         // tail-of-session bytes (in-flight CSI frames, post-`q`
                         // boot text, command echoes) on the floor instead of
@@ -1275,7 +1275,7 @@ mod tests {
     /// alongside it survives.
     #[test]
     fn framed_log_line_is_text() {
-        assert!(is_text_frame(b"he20-stats rx=1744 drop=0 logdrop=0\r\n"));
+        assert!(is_text_frame(b"rx-stats rx=1744 drop=0 logdrop=0\r\n"));
         assert!(is_text_frame(b"esp-now version 20"));
     }
 

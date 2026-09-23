@@ -21,7 +21,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 axum = { version = "0.8.8", features = ["ws"] }
 # Named features rather than `full`. `full` is 9.2s to compile and pulls `fs`, `io-std`, `process`,
 # `parking_lot` and `signal-hook-registry` — and because feature unification is per-graph, it forced them
-# on every consumer too: `csi-pipeline-agent` inherited `full` from here even though its own manifest asks
+# on every consumer too: a downstream crate inherited `full` from here even though its own manifest asked
 # for seven features. What this crate actually uses is tokio::{io, net, select, spawn, sync, task, time}.
 tokio = { version = "1.50.0", default-features = false, features = [
     "rt",
@@ -41,11 +41,11 @@ chrono = { version = "0.4", features = ["clock"] }
 postcard = { version = "1", features = ["use-std"] }
 # The `arrow` facade is deliberately not used — it is the sole parent of arrow-cast, arrow-ord,
 # arrow-arith, arrow-row, arrow-string, arrow-csv and arrow-json, none of which this crate touches
-# (`parquet_sink.rs` uses only array/datatypes/record_batch/error). This must stay in step with
-# csi-pipeline-agent's declaration: it is a dependency of the agent, so a default-featured `arrow`
-# here would put the whole umbrella back into the agent's graph regardless of what the agent asks for.
+# (`parquet_sink.rs` uses only array/datatypes/record_batch/error). Feature unification applies here
+# too: a default-featured `arrow` in this crate would put the whole umbrella back into every
+# consumer's graph regardless of what the consumer asks for.
 arrow-array = "59"
 arrow-schema = "59"
-# SNAPPY is what this sink writes; zstd is what csi-pipeline-agent's recorder writes. Both are needed
-# because either crate may read the other's files.
+# SNAPPY is what this sink writes; zstd is kept for consumers that share this `parquet` dependency to
+# write and read zstd-compressed files, which is the other codec in use downstream.
 parquet = { version = "59", default-features = false, features = ["arrow", "zstd", "snap"] }

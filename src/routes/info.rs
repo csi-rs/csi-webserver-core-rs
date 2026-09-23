@@ -1,4 +1,4 @@
-//! Firmware-identification endpoint at `GET /api/info`.
+//! Firmware-identification endpoint at `GET /api/devices/{id}/info`.
 //!
 //! This endpoint sends the device-side `info` command and surfaces the parsed
 //! magic block as JSON. It exists primarily so a host can verify whether the
@@ -25,7 +25,7 @@ pub enum InfoResult {
     Err(ApiResponse),
 }
 
-/// `GET /api/info` — issue an `info` command on the device and return the
+/// `GET /api/devices/{id}/info` — issue an `info` command on the device and return the
 /// parsed identification block.
 ///
 /// Status codes:

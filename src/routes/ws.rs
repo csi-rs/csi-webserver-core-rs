@@ -18,7 +18,7 @@ use crate::{
     routes::Device,
 };
 
-// ─── GET /api/ws ────────────────────────────────────────────────────────────
+// ─── GET /api/devices/{id}/ws ───────────────────────────────────────────────
 
 /// Upgrade an HTTP connection to a WebSocket and stream raw CSI frames.
 ///
