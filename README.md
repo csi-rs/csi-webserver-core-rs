@@ -23,10 +23,10 @@ For the ready-to-run executable, see [`csi-webserver`](https://github.com/csi-rs
 
 ## Node modes
 
-`POST /api/config/wifi` mirrors the firmware's `set-wifi --mode=` grammar. Each value names one
-**operational mode** — how a node reaches the channel. The other three attributes that describe a
-node (network role, collection mode, session role) are not set here: each mode carries only the
-ones it admits.
+`POST /api/devices/{id}/config/wifi` mirrors the firmware's `set-wifi` grammar. Its `mode` names
+one **operational mode** — how a node reaches the channel. Of the other three attributes that
+describe a node, the network role follows from the mode, the collection mode is the optional
+`collection` field (below), and the session role is always responder: the host initiates.
 
 The model is documented once, in
 [`esp-csi-rs/docs/network-model.md`](https://github.com/csi-rs/esp-csi-rs/blob/main/docs/network-model.md).
@@ -41,22 +41,48 @@ This crate validates against it and does not restate it.
 | `esp-now-central` / `esp-now-peripheral` | the symmetric connectionless exchange |
 | `esp-now-fast-source` / `esp-now-fast-collector` | the asymmetric exchange; also spelled `esp-now-simplex-source` / `esp-now-simplex-peer` |
 
+`peer_mac` is the emitter's injection destination and the explicit ESP-NOW peer (set it on both
+nodes); `ht40` is the softAP secondary channel in `wifi-ap` and the forced per-peer TX PHY in the
+ESP-NOW modes. `channel` is forwarded as given: 1–14 on 2.4 GHz, plus the 5 GHz channels on the
+ESP32-C5 (default 149).
+
+### Collection mode
+
+`"collection": "collector" | "listener"` (optional) is sent as `set-wifi --collection=`. A collector
+captures CSI and reports it; a listener captures but does not report.
+
+| Mode | `collection` |
+|---|---|
+| `station`, `wifi-ap`, `esp-now-central`, `esp-now-peripheral` | accepted, either value |
+| `sniffer`, `esp-now-fast-collector` / `esp-now-simplex-peer` | **400** — fixed collector |
+| `ht20-emitter`, `ht40-emitter`, `esp-now-fast-source` / `esp-now-simplex-source` | **400** — fixed listener |
+| a mode added by a `CsiProfile` | passed through unchecked |
+
+Omit the field to leave the device's stored value alone (the firmware default is `collector`). The
+check is made against the `mode` in the same request, which this route requires.
+
 Modes this crate does not name — chip-gated ones, or those supplied by a build it does not target —
 are added by an embedder through
 [`CsiProfile::extra_wifi_modes`](src/profile.rs); their mode-specific flags ride through the
 flattened `extra` map on the request body and re-emit verbatim as `--{key}={value}`, so this crate
 never names any of them.
 
-`POST /api/config/csi-output` (`{ "enabled": true|false }`) gates off-device delivery of captured
-CSI — capture and its RX timing are unchanged either way. It replaces the removed
-`POST /api/config/collection-mode`. Note that this had **no effect** on firmware before
-`esp-csi-rs` 0.11, which stored the flag without reading it.
+### Delivery gate
+
+`POST /api/devices/{id}/config/csi-output` (`{ "enabled": true|false }`) is the runtime delivery
+gate: it switches off-device delivery of captured CSI, and capture and its RX timing are unchanged
+either way. It is not the collection mode — that is `collection` above. Together the two replace
+the removed `config/collection-mode` route. Note that the gate had **no effect** on firmware
+before `esp-csi-rs` 0.11, which stored the flag without reading it.
+
+`POST /api/devices/{id}/config/rate` is reporting only, except on the ESP-NOW pair
+(`esp-now-central` / `esp-now-peripheral`), which applies it.
 
 ## Quick embed
 
 ```toml
 [dependencies]
-csi-webserver-core = "0.1.0"
+csi-webserver-core = "0.2"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ```
