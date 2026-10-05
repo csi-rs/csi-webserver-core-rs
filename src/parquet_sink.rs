@@ -12,6 +12,13 @@
 //! receive time (UTC, microseconds) — distinct from the device `timestamp`
 //! field, which is microseconds since the device's controller start.
 //!
+//! The schema is versioned: the file's key-value metadata carries `csi_schema_version`
+//! ([`SCHEMA_VERSION`]). Version 2 appends the esp-csi-rs 0.12 wire-format columns after the
+//! version 1 set — node and session identity, the frame counter, the 64-bit `timestamp_us`, PPDU
+//! format, bandwidth, subcarrier layout with explicit `subcarrier_index` / `subcarrier_freq_hz`
+//! lists, stimulus, header digest, and the variation and grouped report payloads. They are null for
+//! frames from older firmware.
+//!
 //! ## Durability
 //! Parquet is only readable once its footer is written, when the sink is dropped.
 //! A clean session stop closes the file. An abrupt device unplug or crash leaves
@@ -23,10 +30,10 @@ use std::sync::Arc;
 
 // The two arrow subcrates directly rather than the `arrow` facade — see this crate's Cargo.toml for
 // why (the facade drags in seven subcrates nothing here touches).
-use arrow_array::builder::{Int8Builder, ListBuilder};
+use arrow_array::builder::{Int16Builder, Int32Builder, Int8Builder, ListBuilder, UInt8Builder};
 use arrow_array::{
-    ArrayRef, Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt16Array,
-    UInt32Array, UInt64Array,
+    ArrayRef, BooleanArray, Int16Array, Int32Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use parquet::arrow::ArrowWriter;
@@ -35,6 +42,9 @@ use parquet::file::properties::WriterProperties;
 
 use crate::csi::DecodedCsi;
 use crate::profile::CsiProfile;
+
+/// Version of the column set, written to the file's key-value metadata as `csi_schema_version`.
+pub const SCHEMA_VERSION: &str = "2";
 
 /// Number of buffered rows that triggers a row-group flush.
 const ROW_GROUP_SIZE: usize = 256;
@@ -74,6 +84,10 @@ impl ParquetSink {
         let file = File::create(path)?;
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
+            .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
+                "csi_schema_version".to_string(),
+                SCHEMA_VERSION.to_string(),
+            )]))
             .build();
         let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
         Ok(Self {
@@ -193,6 +207,68 @@ impl ParquetSink {
         }
         let csi_data: ArrayRef = Arc::new(list_builder.finish());
 
+        // ── Wire-format columns (schema version 2) ──
+        let u8_opt = |f: &dyn Fn(&DecodedCsi) -> Option<u8>| -> ArrayRef {
+            Arc::new(UInt8Array::from(rows.iter().map(|r| f(&r.csi)).collect::<Vec<_>>()))
+        };
+        let u16_opt = |f: &dyn Fn(&DecodedCsi) -> Option<u16>| -> ArrayRef {
+            Arc::new(UInt16Array::from(rows.iter().map(|r| f(&r.csi)).collect::<Vec<_>>()))
+        };
+        let u32_opt2 = |f: &dyn Fn(&DecodedCsi) -> Option<u32>| -> ArrayRef {
+            Arc::new(UInt32Array::from(rows.iter().map(|r| f(&r.csi)).collect::<Vec<_>>()))
+        };
+        let u64_opt = |f: &dyn Fn(&DecodedCsi) -> Option<u64>| -> ArrayRef {
+            Arc::new(UInt64Array::from(rows.iter().map(|r| f(&r.csi)).collect::<Vec<_>>()))
+        };
+        let i16_opt = |f: &dyn Fn(&DecodedCsi) -> Option<i16>| -> ArrayRef {
+            Arc::new(Int16Array::from(rows.iter().map(|r| f(&r.csi)).collect::<Vec<_>>()))
+        };
+        let bool_opt = |f: &dyn Fn(&DecodedCsi) -> Option<bool>| -> ArrayRef {
+            Arc::new(BooleanArray::from(rows.iter().map(|r| f(&r.csi)).collect::<Vec<_>>()))
+        };
+        let str_opt = |f: &dyn Fn(&DecodedCsi) -> Option<String>| -> ArrayRef {
+            Arc::new(StringArray::from(rows.iter().map(|r| f(&r.csi)).collect::<Vec<_>>()))
+        };
+        let dbg = |v: &dyn std::fmt::Debug| format!("{v:?}");
+
+        let mut sc_index = ListBuilder::new(Int16Builder::new());
+        let mut sc_freq = ListBuilder::new(Int32Builder::new());
+        let mut grouped_data = ListBuilder::new(UInt8Builder::new());
+        for r in rows {
+            match r.csi.subcarrier_indices() {
+                Some(v) => {
+                    sc_index.values().append_slice(&v);
+                    sc_index.append(true);
+                }
+                None => sc_index.append(false),
+            }
+            match r.csi.subcarrier_freqs_hz() {
+                Some(v) => {
+                    sc_freq.values().append_slice(&v);
+                    sc_freq.append(true);
+                }
+                None => sc_freq.append(false),
+            }
+            match &r.csi.grouped {
+                Some(g) => {
+                    grouped_data.values().append_slice(&g.data);
+                    grouped_data.append(true);
+                }
+                None => grouped_data.append(false),
+            }
+        }
+        let stimulus_parts = |c: &DecodedCsi| -> (Option<&'static str>, Option<u8>, Option<u16>) {
+            use crate::wire::Stimulus;
+            match c.stimulus {
+                Some(Stimulus::Controlled { setup_id, instance_id, .. }) => {
+                    (Some("controlled"), Some(setup_id), Some(instance_id))
+                }
+                Some(Stimulus::Ambient { .. }) => (Some("ambient"), None, None),
+                Some(Stimulus::Observed { .. }) => (Some("observed"), None, None),
+                None => (None, None, None),
+            }
+        };
+
         // Column order MUST match `build_schema()`.
         let columns: Vec<ArrayRef> = vec![
             host_rx,
@@ -245,6 +321,35 @@ impl ParquetSink {
             u32_opt(&|c| c.sigb_len),
             u32_opt(&|c| c.cur_single_mpdu),
             u32_opt(&|c| c.rxmatch0),
+            // wire format (schema version 2)
+            u8_opt(&|c| c.wire_version),
+            str_opt(&|c| c.node_id.as_ref().map(format_mac)),
+            u32_opt2(&|c| c.session_id),
+            u32_opt2(&|c| c.stream_seq),
+            str_opt(&|c| c.source.as_ref().map(|v| dbg(v))),
+            u64_opt(&|c| c.timestamp_us),
+            str_opt(&|c| c.ppdu.as_ref().map(|v| dbg(v))),
+            u16_opt(&|c| c.bandwidth_mhz),
+            str_opt(&|c| c.layout.as_ref().map(|v| dbg(v))),
+            bool_opt(&|c| c.first_word_invalid),
+            u8_opt(&|c| c.n_rx),
+            u8_opt(&|c| c.n_ss),
+            str_opt(&|c| stimulus_parts(c).0.map(str::to_string)),
+            u8_opt(&|c| stimulus_parts(c).1),
+            u16_opt(&|c| stimulus_parts(c).2),
+            u16_opt(&|c| c.header.map(|h| h.frame_control)),
+            str_opt(&|c| c.header.map(|h| format_mac(&h.addr1))),
+            str_opt(&|c| c.header.map(|h| format_mac(&h.addr3))),
+            u16_opt(&|c| c.header.map(|h| h.seq_ctrl)),
+            bool_opt(&|c| c.header.map(|h| h.is_retry())),
+            Arc::new(sc_index.finish()),
+            Arc::new(sc_freq.finish()),
+            u16_opt(&|c| c.variation),
+            u8_opt(&|c| c.grouped.as_ref().map(|g| g.ng)),
+            u8_opt(&|c| c.grouped.as_ref().map(|g| g.nb)),
+            i16_opt(&|c| c.grouped.as_ref().map(|g| g.sc_start)),
+            u16_opt(&|c| c.grouped.as_ref().map(|g| g.n_sc)),
+            Arc::new(grouped_data.finish()),
         ];
 
         Ok(RecordBatch::try_new(self.schema.clone(), columns)?)
@@ -336,6 +441,47 @@ fn build_schema() -> Arc<Schema> {
         opt_u32("sigb_len"),
         opt_u32("cur_single_mpdu"),
         opt_u32("rxmatch0"),
+        // wire format (schema version 2): null for frames from esp-csi-rs 0.11 and earlier
+        Field::new("wire_version", DataType::UInt8, true),
+        Field::new("node_id", DataType::Utf8, true),
+        opt_u32("session_id"),
+        opt_u32("stream_seq"),
+        Field::new("source", DataType::Utf8, true),
+        opt_u64("timestamp_us"),
+        Field::new("ppdu", DataType::Utf8, true),
+        Field::new("bandwidth_mhz", DataType::UInt16, true),
+        Field::new("layout", DataType::Utf8, true),
+        Field::new("first_word_invalid", DataType::Boolean, true),
+        Field::new("n_rx", DataType::UInt8, true),
+        Field::new("n_ss", DataType::UInt8, true),
+        Field::new("stimulus", DataType::Utf8, true),
+        Field::new("setup_id", DataType::UInt8, true),
+        Field::new("instance_id", DataType::UInt16, true),
+        Field::new("frame_control", DataType::UInt16, true),
+        Field::new("addr1", DataType::Utf8, true),
+        Field::new("addr3", DataType::Utf8, true),
+        Field::new("seq_ctrl", DataType::UInt16, true),
+        Field::new("retry", DataType::Boolean, true),
+        Field::new(
+            "subcarrier_index",
+            DataType::List(Arc::new(Field::new("item", DataType::Int16, true))),
+            true,
+        ),
+        Field::new(
+            "subcarrier_freq_hz",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        ),
+        Field::new("variation", DataType::UInt16, true),
+        Field::new("grouped_ng", DataType::UInt8, true),
+        Field::new("grouped_nb", DataType::UInt8, true),
+        Field::new("grouped_sc_start", DataType::Int16, true),
+        Field::new("grouped_n_sc", DataType::UInt16, true),
+        Field::new(
+            "grouped_data",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
+            true,
+        ),
     ];
     Arc::new(Schema::new(fields))
 }
@@ -444,6 +590,47 @@ mod tests {
         let batch = reader.next().unwrap().unwrap();
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), build_schema().fields().len());
+        let _ = std::fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn real_he20_capture_fills_the_v2_columns() {
+        use arrow_array::{Array, ListArray, StringArray, UInt64Array};
+        use crate::csi::{decode_frame, DecodedFrame};
+
+        let capture: &[u8] = include_bytes!("../tests/fixtures/c5_he20_sniffer.bin");
+        let path = std::env::temp_dir().join("csi_sink_v2_test.parquet");
+        let path_str = path.to_str().unwrap();
+        let mut rows = 0;
+        {
+            let mut sink =
+                ParquetSink::open(path_str, "esp32c5", Arc::new(crate::profile::StandardCsiProfile))
+                    .unwrap();
+            for frame in capture.split(|&b| b == 0).filter(|f| !f.is_empty()) {
+                if let Ok(DecodedFrame::Csi(d)) = decode_frame(frame, ChipVariant::Esp32c5) {
+                    sink.push(d, 0).unwrap();
+                    rows += 1;
+                }
+            }
+        }
+
+        let file = File::open(path_str).unwrap();
+        let builder =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let kv = builder.metadata().file_metadata().key_value_metadata().unwrap();
+        assert!(kv.iter().any(|e| e.key == "csi_schema_version" && e.value.as_deref() == Some(SCHEMA_VERSION)));
+        let batch = builder.build().unwrap().next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), rows.min(ROW_GROUP_SIZE));
+
+        let col = |name: &str| batch.column(batch.schema().index_of(name).unwrap()).clone();
+        let layout = col("layout");
+        let layout = layout.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(layout.value(rows - 1), "C5He20Su");
+        let ts = col("timestamp_us");
+        assert!(ts.as_any().downcast_ref::<UInt64Array>().unwrap().value(0) > 0);
+        let sc = col("subcarrier_index");
+        let sc = sc.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(sc.value(rows - 1).len(), 245);
         let _ = std::fs::remove_file(path_str);
     }
 }

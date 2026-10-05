@@ -816,12 +816,23 @@ async fn run_serial_connection(
                             frames_in += 1;
                             if matches!(current_mode, OutputMode::Dump | OutputMode::Both) {
                                 if let (Some(sink), Some(chip)) = (sink.as_mut(), chip.as_ref()) {
-                                    match csi::decode(&buf, chip.variant) {
-                                        Ok(decoded) => {
+                                    match csi::decode_frame(&buf, chip.variant) {
+                                        Ok(csi::DecodedFrame::Csi(decoded)) => {
                                             let host_rx = chrono::Utc::now().timestamp_micros();
                                             if let Err(e) = sink.push(decoded, host_rx) {
                                                 tracing::error!("Parquet write error: {e}");
                                             }
+                                        }
+                                        Ok(csi::DecodedFrame::Session { envelope, info }) => {
+                                            tracing::info!(
+                                                "{port_path} session {:#010x}: chip {:?}, firmware {}.{}.{}, wall-clock anchor {:?}",
+                                                envelope.session_id,
+                                                info.chip,
+                                                info.crate_version[0],
+                                                info.crate_version[1],
+                                                info.crate_version[2],
+                                                info.epoch_unix_us,
+                                            );
                                         }
                                         Err(e) => {
                                             decode_errors += 1;

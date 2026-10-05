@@ -73,6 +73,9 @@ pub mod serial;
 pub mod server;
 pub mod state;
 pub mod supervisor;
+// Vendored from esp-csi-rs (a `no_std` crate, where the measurement variant cannot be boxed).
+#[allow(clippy::large_enum_variant)]
+pub mod wire;
 
 pub use profile::{CsiProfile, StandardCsiProfile};
 pub use serial::{ExternalDeviceChannels, spawn_external_device};

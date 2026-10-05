@@ -955,15 +955,21 @@ pub struct DeviceInfo {
 /// different value — or none at all, which means a pre-protocol-2 build —
 /// may silently misinterpret the commands this crate composes, so hosts
 /// should treat a mismatch as "reflash required" rather than degrade.
-pub const SUPPORTED_CLI_PROTOCOL: u32 = 2;
+pub const SUPPORTED_CLI_PROTOCOL: u32 = 3;
+
+/// Oldest CLI protocol this crate still drives. Protocol 3 changed only the serialized CSI format
+/// (esp-csi-rs 0.12's `wire` frames), and [`crate::csi::decode_frame`] decodes both that and the
+/// protocol-2 layouts, so a protocol-2 board is still supported.
+pub const MIN_SUPPORTED_CLI_PROTOCOL: u32 = 2;
 
 impl DeviceInfo {
-    /// Whether the firmware speaks exactly the CLI protocol this crate
-    /// targets. A missing `protocol=` line reads as unsupported: only
+    /// Whether the firmware speaks a CLI protocol this crate drives
+    /// ([`MIN_SUPPORTED_CLI_PROTOCOL`]..=[`SUPPORTED_CLI_PROTOCOL`]). A missing `protocol=` line reads as unsupported: only
     /// pre-protocol-2 firmware omits it, and that grammar predates CLI
     /// protocol 2.
     pub fn protocol_supported(&self) -> bool {
-        self.protocol == Some(SUPPORTED_CLI_PROTOCOL)
+        self.protocol
+            .is_some_and(|p| (MIN_SUPPORTED_CLI_PROTOCOL..=SUPPORTED_CLI_PROTOCOL).contains(&p))
     }
 }
 
@@ -1148,10 +1154,11 @@ mod tests {
             features: Vec::new(),
         };
         assert!(info(Some(SUPPORTED_CLI_PROTOCOL)).protocol_supported());
-        // Older and newer grammars are both refused: the composed commands
+        assert!(info(Some(2)).protocol_supported());
+        // Older and newer grammars are refused: the composed commands
         // may parse differently (or not at all) on either side.
         assert!(!info(Some(1)).protocol_supported());
-        assert!(!info(Some(3)).protocol_supported());
+        assert!(!info(Some(4)).protocol_supported());
         // No `protocol=` line means pre-protocol-2 firmware.
         assert!(!info(None).protocol_supported());
     }

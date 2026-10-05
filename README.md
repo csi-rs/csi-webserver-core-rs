@@ -17,7 +17,7 @@ For the ready-to-run executable, see [`csi-webserver`](https://github.com/csi-rs
 
 - Axum HTTP API under `/api/devices/{id}/...`
 - Per-device WebSocket CSI frame stream (`/ws`)
-- Parquet session dumps (decoded from serialized COBS+postcard frames)
+- Parquet session dumps decoded from the firmware's serialized frames
 - USB hotplug supervisor ([`supervisor`](src/supervisor.rs))
 - Explicit device registration ([`DeviceRegistry::attach`](src/state.rs))
 
@@ -25,8 +25,8 @@ For the ready-to-run executable, see [`csi-webserver`](https://github.com/csi-rs
 
 `POST /api/devices/{id}/config/wifi` mirrors the firmware's `set-wifi` grammar. Its `mode` names
 one **operational mode** — how a node reaches the channel. Of the other three attributes that
-describe a node, the network role follows from the mode, the collection mode is the optional
-`collection` field (below), and the session role is always responder: the host initiates.
+describe a node, the network role follows from the mode, the reporting policy is the optional
+`collection` field (below), and the host is the session's controller.
 
 The model is documented once, in
 [`esp-csi-rs/docs/network-model.md`](https://github.com/csi-rs/esp-csi-rs/blob/main/docs/network-model.md).
@@ -49,7 +49,7 @@ ESP32-C5 (default 149).
 ### Collection mode
 
 `"collection": "collector" | "listener"` (optional) is sent as `set-wifi --collection=`. A collector
-captures CSI and reports it; a listener captures but does not report.
+reports the CSI it captures; a listener captures but does not report.
 
 | Mode | `collection` |
 |---|---|
@@ -71,18 +71,27 @@ never names any of them.
 
 `POST /api/devices/{id}/config/csi-output` (`{ "enabled": true|false }`) is the runtime delivery
 gate: it switches off-device delivery of captured CSI, and capture and its RX timing are unchanged
-either way. It is not the collection mode — that is `collection` above. Together the two replace
-the removed `config/collection-mode` route. Note that the gate had **no effect** on firmware
-before `esp-csi-rs` 0.11, which stored the flag without reading it.
+either way. It is separate from `collection` above.
 
 `POST /api/devices/{id}/config/rate` is reporting only, except on the ESP-NOW pair
 (`esp-now-central` / `esp-now-peripheral`), which applies it.
+
+## Decoding
+
+[`csi::decode_frame`](src/csi.rs) reads esp-csi-rs's versioned wire format (the module is vendored
+in [`src/wire`](src/wire), unmodified) and falls back to the pre-0.12 per-chip layouts, so mixed
+firmware decodes. Session announcements are logged; measurements become a `DecodedCsi`.
+
+Parquet files carry `csi_schema_version` in their metadata. Version 2 adds node and session ids,
+the frame counter, a 64-bit `timestamp_us`, PPDU format, bandwidth, the subcarrier layout with
+`subcarrier_index` / `subcarrier_freq_hz`, stimulus (setup and instance ids), the MAC-header digest,
+and the variation and grouped report payloads. They are null for frames from older firmware.
 
 ## Quick embed
 
 ```toml
 [dependencies]
-csi-webserver-core = "0.2"
+csi-webserver-core = "0.3"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ```
@@ -134,7 +143,8 @@ from USB enumeration before attaching.
 | `ServerConfig`, `build_router`, `serve` | HTTP server |
 | `SupervisorConfig`, `run_supervisor`, `detect_esp_ports`, `probe_port` | Hotplug discovery |
 | `models` | JSON request/response types and CLI command mappers |
-| `csi` | COBS/postcard frame decoder |
+| `csi` | Serialized frame decoder |
+| `wire` | esp-csi-rs's wire format (vendored) |
 | `routes` | Axum handler functions (for custom router extension) |
 | `serial`, `parquet_sink` | Lower-level pipelines |
 
@@ -150,14 +160,6 @@ let state = AppState::new();
 let app: Router = build_router(state);
 // or nest `build_router(state)` under your own paths
 ```
-
-## Migration from pre-0.1.5 single crate
-
-| Before | After |
-|--------|-------|
-| `csi_webserver::run_supervisor` | `csi_webserver_core::run_supervisor` |
-| `spawn_device` + `registry.insert` | `registry.attach(DeviceAttachSpec { ... })` |
-| Binary in same crate | Use `csi-webserver` or embed this library |
 
 ## Related crates
 

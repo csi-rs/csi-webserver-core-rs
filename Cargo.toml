@@ -1,6 +1,6 @@
 [package]
 name = "csi-webserver-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Embeddable HTTP/WebSocket library for streaming ESP32 CSI data over USB serial"
 license = "Apache-2.0"
@@ -16,6 +16,10 @@ authors = ["stacks-of-data", "theembeddedrustacean"]
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+## The synthetic IEEE 802.11bf source from the vendored `wire` module, for tests and demos.
+synthetic = []
 
 [dependencies]
 axum = { version = "0.8.8", features = ["ws"] }
@@ -38,7 +42,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 chrono = { version = "0.4", features = ["clock"] }
-postcard = { version = "1", features = ["use-std"] }
+postcard = { version = "1", features = ["use-std", "experimental-derive", "heapless"] }
+# The vendored `wire` module (esp-csi-rs's frame format) is `no_std` and uses heapless 0.7 and cobs,
+# matching the firmware.
+heapless = { version = "0.7", default-features = false, features = ["serde"] }
+cobs = { version = "0.3", default-features = false }
 # The `arrow` facade is deliberately not used — it is the sole parent of arrow-cast, arrow-ord,
 # arrow-arith, arrow-row, arrow-string, arrow-csv and arrow-json, none of which this crate touches
 # (`parquet_sink.rs` uses only array/datatypes/record_batch/error). Feature unification applies here
