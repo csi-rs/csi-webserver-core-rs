@@ -24,9 +24,10 @@ For the ready-to-run executable, see [`csi-webserver`](https://github.com/csi-rs
 ## Node modes
 
 `POST /api/devices/{id}/config/wifi` mirrors the firmware's `set-wifi` grammar. Its `mode` names
-one **operational mode** — how a node reaches the channel. Of the other three attributes that
-describe a node, the network role follows from the mode, the reporting policy is the optional
-`collection` field (below), and the host is the session's controller.
+how a node reaches the channel. A node is described with IEEE 802.11bf's vocabulary: the
+**session role** (initiator or responder; none for an observer) and the **sensing role**
+(transmitter, receiver or both) follow from the mode, and **reporting** is the optional
+`reporting` field (below). The host only starts and stops runs; it is never a session initiator.
 
 The model is documented once, in
 [`esp-csi-rs/docs/network-model.md`](https://github.com/csi-rs/esp-csi-rs/blob/main/docs/network-model.md).
@@ -38,27 +39,27 @@ This crate validates against it and does not restate it.
 | `sniffer` | promiscuous capture on a locked channel |
 | `wifi-ap` | a self-contained softAP with DHCP |
 | `ht20-emitter` / `ht40-emitter` | unassociated raw 802.11n injection, 20 or 40 MHz |
-| `esp-now-central` / `esp-now-peripheral` | the symmetric connectionless exchange |
-| `esp-now-fast-source` / `esp-now-fast-collector` | the asymmetric exchange; also spelled `esp-now-simplex-source` / `esp-now-simplex-peer` |
+| `esp-now-initiator` / `esp-now-responder` | the symmetric connectionless exchange |
+| `esp-now-simplex-source` / `esp-now-simplex-peer` | the one-way exchange: the source transmits, the peer receives |
 
 `peer_mac` is the emitter's injection destination and the explicit ESP-NOW peer (set it on both
 nodes); `ht40` is the softAP secondary channel in `wifi-ap` and the forced per-peer TX PHY in the
 ESP-NOW modes. `channel` is forwarded as given: 1–14 on 2.4 GHz, plus the 5 GHz channels on the
 ESP32-C5 (default 149).
 
-### Collection mode
+### Reporting
 
-`"collection": "collector" | "listener"` (optional) is sent as `set-wifi --collection=`. A collector
-reports the CSI it captures; a listener captures but does not report.
+`"reporting": "report" | "none"` (optional) is sent as `set-wifi --reporting=`. A node set to
+`report` delivers the CSI it measures to the host; `none` measures but reports nothing.
 
-| Mode | `collection` |
+| Mode | `reporting` |
 |---|---|
-| `station`, `wifi-ap`, `esp-now-central`, `esp-now-peripheral` | accepted, either value |
-| `sniffer`, `esp-now-fast-collector` / `esp-now-simplex-peer` | **400** — fixed collector |
-| `ht20-emitter`, `ht40-emitter`, `esp-now-fast-source` / `esp-now-simplex-source` | **400** — fixed listener |
+| `station`, `wifi-ap`, `esp-now-initiator`, `esp-now-responder` | accepted, either value |
+| `sniffer`, `esp-now-simplex-peer` | **400** — fixed `report` |
+| `ht20-emitter`, `ht40-emitter`, `esp-now-simplex-source` | **400** — fixed `none` |
 | a mode added by a `CsiProfile` | passed through unchecked |
 
-Omit the field to leave the device's stored value alone (the firmware default is `collector`). The
+Omit the field to leave the device's stored value alone (the firmware default is `report`). The
 check is made against the `mode` in the same request, which this route requires.
 
 Modes this crate does not name — chip-gated ones, or those supplied by a build it does not target —
@@ -67,14 +68,38 @@ are added by an embedder through
 flattened `extra` map on the request body and re-emit verbatim as `--{key}={value}`, so this crate
 never names any of them.
 
+### Measurement periodicity
+
+`POST /api/devices/{id}/config/measurement` (`{ "periodicity_hz": 100, "unsolicited": false }`) is
+sent as `set-measurement --periodicity-hz=` — the rate of the traffic a node generates to measure
+on; `0` disables it. The cached config reports it as `collection.periodicity_hz`.
+
 ### Delivery gate
 
 `POST /api/devices/{id}/config/csi-output` (`{ "enabled": true|false }`) is the runtime delivery
 gate: it switches off-device delivery of captured CSI, and capture and its RX timing are unchanged
-either way. It is separate from `collection` above.
+either way. It is separate from `reporting` above.
 
 `POST /api/devices/{id}/config/rate` is reporting only, except on the ESP-NOW pair
-(`esp-now-central` / `esp-now-peripheral`), which applies it.
+(`esp-now-initiator` / `esp-now-responder`), which applies it.
+
+### Upgrading from 0.3
+
+0.4 adopts the firmware's CLI protocol 4 grammar with no aliases, and drives only protocol-4
+firmware (`MIN_SUPPORTED_CLI_PROTOCOL = SUPPORTED_CLI_PROTOCOL = 4`):
+
+| 0.3 | 0.4 |
+|---|---|
+| `CollectionMode::{Collector, Listener}` | `Reporting::{Report, None}` (`"report"` / `"none"`) |
+| `WifiConfig.collection` / `--collection=` | `WifiConfig.reporting` / `--reporting=` |
+| `FIXED_COLLECTION_MODES` | `FIXED_REPORTING_MODES` |
+| `esp-now-central` / `esp-now-peripheral` | `esp-now-initiator` / `esp-now-responder` |
+| `esp-now-fast-source` / `esp-now-fast-collector` | `esp-now-simplex-source` / `esp-now-simplex-peer` |
+| `POST …/config/traffic {frequency_hz}`, `TrafficConfig` | `POST …/config/measurement {periodicity_hz}`, `MeasurementConfig` |
+| `set-traffic --frequency-hz=` | `set-measurement --periodicity-hz=` |
+| cached `wifi.collection`, `collection.traffic_hz` | `wifi.reporting`, `collection.periodicity_hz` |
+
+The wire format and the `wire` module are unchanged.
 
 ## Decoding
 
@@ -91,7 +116,7 @@ and the variation and grouped report payloads. They are null for frames from old
 
 ```toml
 [dependencies]
-csi-webserver-core = "0.3"
+csi-webserver-core = "0.4"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ```

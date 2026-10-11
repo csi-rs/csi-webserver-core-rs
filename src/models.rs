@@ -76,10 +76,10 @@ pub struct WifiSection {
     /// The softAP secondary channel in `wifi-ap` mode, and the forced
     /// per-peer TX PHY in the ESP-NOW modes.
     pub ht40: Option<String>,
-    /// The node's stored **collection mode**, set with `set-wifi
-    /// --collection=`. Only the modes that admit a choice read it (see
-    /// [`WifiConfig::collection`]); the firmware default is `collector`.
-    pub collection: Option<CollectionMode>,
+    /// The node's stored **reporting** setting, set with `set-wifi
+    /// --reporting=`. Only the modes that admit a choice read it (see
+    /// [`WifiConfig::reporting`]); the firmware default is `report`.
+    pub reporting: Option<Reporting>,
 }
 
 /// `[Collection]` section in `show-config`.
@@ -89,13 +89,14 @@ pub struct CollectionSection {
     /// Whether captured CSI is delivered off-device; capture itself keeps
     /// running either way. Set via [`CsiOutputConfig`].
     pub csi_output_enabled: Option<bool>,
-    /// `trigger_freq` Hz. `0` disables traffic generation.
-    pub traffic_hz: Option<u64>,
+    /// Measurement periodicity in Hz (`set-measurement --periodicity-hz=`),
+    /// reported as `Periodicity` in `show-config`. `0` disables generated traffic.
+    pub periodicity_hz: Option<u64>,
     /// `flood_unsolicited` — ICMP flood sends unsolicited echo replies
     /// (one-directional traffic) instead of echo requests.
     pub unsolicited: Option<bool>,
     /// `phy_rate` enum — e.g. `mcs0-lgi`. Reporting only, except on the
-    /// ESP-NOW pair (`esp-now-central` / `esp-now-peripheral`), which applies it.
+    /// ESP-NOW pair (`esp-now-initiator` / `esp-now-responder`), which applies it.
     pub phy_rate: Option<String>,
     /// `protocol` — Wi-Fi PHY protocol applied at the start of each run.
     /// One of `b` | `g` | `n` | `lr` | `a` | `ac`; defaults to `lr`.
@@ -192,11 +193,11 @@ impl DeviceConfig {
                 ap_burst: Some(false),
                 peer_mac: Some("broadcast".to_string()),
                 ht40: Some("none".to_string()),
-                collection: Some(CollectionMode::Collector),
+                reporting: Some(Reporting::Report),
             },
             collection: CollectionSection {
                 csi_output_enabled: Some(true),
-                traffic_hz: Some(100),
+                periodicity_hz: Some(100),
                 unsolicited: Some(false),
                 phy_rate: Some("mcs0-lgi".to_string()),
                 protocol: Some("lr".to_string()),
@@ -283,18 +284,17 @@ fn validate_peer_mac(mac: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Accepted `set-wifi --mode=` values — one per **operational mode** the firmware offers.
+/// Accepted `set-wifi --mode=` values — one per **mode** the firmware offers.
 ///
-/// A node is described by four attributes, of which the mode is one. The network role follows from
-/// the mode here; the collection mode is chosen with [`WifiConfig::collection`] in the modes that
-/// admit a choice ([`FIXED_COLLECTION_MODES`] lists the ones that do not); the session role is
-/// always responder, since the host initiates. The model is documented once, in
+/// A node is described by its mode, session role (initiator or responder; none for an observer),
+/// sensing role (transmitter, receiver or both) and reporting. The session and sensing roles follow
+/// from the mode here; reporting is chosen with [`WifiConfig::reporting`] in the modes that admit
+/// a choice ([`FIXED_REPORTING_MODES`] lists the ones that do not). The host only starts and stops
+/// runs; it is never a session initiator. The model is documented once, in
 /// [`docs/network-model.md`](https://github.com/csi-rs/esp-csi-rs/blob/main/docs/network-model.md),
 /// and deliberately not restated here.
 ///
-/// This list must stay a superset of what the firmware accepts. It was previously short by the four
-/// ESP-NOW modes, which the firmware and the CLI both shipped throughout — so every `esp-now-*`
-/// mode a user could select on the console was rejected by this API.
+/// This list must stay a superset of what the firmware accepts.
 ///
 /// Modes this crate does not name — chip-gated ones, or those supplied by a build it does not
 /// target — arrive through
@@ -306,54 +306,49 @@ pub const WIFI_MODES: &[&str] = &[
     "wifi-ap",
     "ht20-emitter",
     "ht40-emitter",
-    "esp-now-central",
-    "esp-now-peripheral",
-    // Two spellings per simplex end: the `-fast-` strings are what the firmware has always
-    // accepted, the `-simplex-` ones match the model, where the end that floods is the central.
-    "esp-now-fast-collector",
-    "esp-now-fast-source",
-    "esp-now-simplex-peer",
+    "esp-now-initiator",
+    "esp-now-responder",
     "esp-now-simplex-source",
+    "esp-now-simplex-peer",
 ];
 
-/// Base modes whose collection mode is fixed by the mode itself, paired with that fixed value.
-/// Sending [`WifiConfig::collection`] with one of these is rejected rather than silently ignored.
+/// Base modes whose reporting is fixed by the mode itself, paired with that fixed value.
+/// Sending [`WifiConfig::reporting`] with one of these is rejected rather than silently ignored.
 ///
-/// The sniffer must report to observe anything, so it is a collector; the emitters capture nothing,
-/// so they are listeners; a simplex source floods (a central listener) and a simplex peer is
-/// receive-only (a peripheral collector). Every other base mode — station, access point and the
-/// symmetric ESP-NOW pair — admits either value, and a mode supplied by a
-/// [`CsiProfile`] is passed through unchecked.
-pub const FIXED_COLLECTION_MODES: &[(&str, CollectionMode)] = &[
-    ("sniffer", CollectionMode::Collector),
-    ("ht20-emitter", CollectionMode::Listener),
-    ("ht40-emitter", CollectionMode::Listener),
-    ("esp-now-fast-source", CollectionMode::Listener),
-    ("esp-now-simplex-source", CollectionMode::Listener),
-    ("esp-now-fast-collector", CollectionMode::Collector),
-    ("esp-now-simplex-peer", CollectionMode::Collector),
+/// The sniffer must report to observe anything; the emitters measure nothing, so they report
+/// nothing; a simplex source only transmits (reports nothing) and a simplex peer only receives
+/// (reports). Every other base mode — station, access point and the symmetric ESP-NOW pair —
+/// admits either value, and a mode supplied by a [`CsiProfile`] is passed through unchecked.
+pub const FIXED_REPORTING_MODES: &[(&str, Reporting)] = &[
+    ("sniffer", Reporting::Report),
+    ("ht20-emitter", Reporting::None),
+    ("ht40-emitter", Reporting::None),
+    ("esp-now-simplex-source", Reporting::None),
+    ("esp-now-simplex-peer", Reporting::Report),
 ];
 
-/// A node's **collection mode** — whether its measurements leave it. Serialized lowercase
-/// (`"collector"` / `"listener"`) and sent as `set-wifi --collection=`.
+/// A node's **reporting** — whether the measurements it takes are reported to the host.
+/// Serialized lowercase (`"report"` / `"none"`) and sent as `set-wifi --reporting=`.
 ///
-/// A collector captures CSI and reports it; a listener captures but does not report. This is
-/// distinct from [`CsiOutputConfig`], which is only a runtime gate on delivery.
+/// A node that reports delivers the CSI it measures; one set to `none` measures but reports
+/// nothing. This is distinct from [`CsiOutputConfig`], which is only a runtime gate on delivery.
+/// The firmware's threshold-based and decimated reporting, and `--report-to=`, are not modelled
+/// here; send them through [`WifiConfig::extra`] if needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum CollectionMode {
-    /// Captures CSI and reports it — its own, and any reported to it by peers.
-    Collector,
-    /// Captures CSI but does not report it.
-    Listener,
+pub enum Reporting {
+    /// Measures CSI and reports it — its own, and any reported to it by peers.
+    Report,
+    /// Measures CSI but reports nothing.
+    None,
 }
 
-impl CollectionMode {
-    /// The CLI token: `collector` or `listener`.
+impl Reporting {
+    /// The CLI token: `report` or `none`.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Collector => "collector",
-            Self::Listener => "listener",
+            Self::Report => "report",
+            Self::None => "none",
         }
     }
 }
@@ -392,18 +387,18 @@ pub struct WifiConfig {
     pub ht40: Option<String>,
     /// Which interface an emitter injects on: `sta` | `ap`. The driver
     /// accepts raw TX on both, but which one actually radiates is
-    /// chip-dependent, so this is the first thing to flip when a collector
+    /// chip-dependent, so this is the first thing to flip when a receiver
     /// sees nothing while the emitter reports no rejected frames. Emitter
     /// modes only; the firmware ignores it elsewhere and defaults to the
     /// STA interface when the flag is omitted, so `None` sends nothing.
     pub emitter_iface: Option<String>,
-    /// The node's collection mode, sent as `--collection=collector|listener`.
-    /// Accepted for `station`, `wifi-ap`, `esp-now-central` and
-    /// `esp-now-peripheral`, and passed through for profile-supplied modes.
-    /// Rejected for the modes in [`FIXED_COLLECTION_MODES`], whose collection
-    /// mode is fixed. `None` sends nothing, so the firmware keeps its stored
-    /// value (default `collector`).
-    pub collection: Option<CollectionMode>,
+    /// The node's reporting, sent as `--reporting=report|none`.
+    /// Accepted for `station`, `wifi-ap`, `esp-now-initiator` and
+    /// `esp-now-responder`, and passed through for profile-supplied modes.
+    /// Rejected for the modes in [`FIXED_REPORTING_MODES`], whose reporting
+    /// is fixed. Omitted sends nothing, so the firmware keeps its stored
+    /// value (default `report`).
+    pub reporting: Option<Reporting>,
     /// Parameters the core does not name are carried verbatim here and
     /// re-emitted generically as `--{key}={value}` (same convention as
     /// [`CsiConfig::extra`]). This lets an embedder's [`CsiProfile`] accept
@@ -542,18 +537,18 @@ impl WifiConfig {
             cmd.push_str(&format!(" --emitter-iface={iface}"));
         }
 
-        if let Some(collection) = self.collection {
-            if let Some((_, fixed)) = FIXED_COLLECTION_MODES
+        if let Some(reporting) = self.reporting {
+            if let Some((_, fixed)) = FIXED_REPORTING_MODES
                 .iter()
                 .find(|(mode, _)| *mode == self.mode)
             {
                 return Err(format!(
-                    "mode '{}' has a fixed collection mode ({}); omit collection",
+                    "mode '{}' has a fixed reporting ({}); omit reporting",
                     self.mode,
                     fixed.as_str()
                 ));
             }
-            cmd.push_str(&format!(" --collection={}", collection.as_str()));
+            cmd.push_str(&format!(" --reporting={}", reporting.as_str()));
         }
 
         // Profile-supplied / unknown params (e.g. an emitter's inter-frame
@@ -566,10 +561,12 @@ impl WifiConfig {
     }
 }
 
+/// `POST /api/devices/{id}/config/measurement` — the `set-measurement` command.
 #[derive(Debug, Deserialize)]
-pub struct TrafficConfig {
-    /// Traffic generation frequency in Hz; `0` disables generation.
-    pub frequency_hz: u64,
+pub struct MeasurementConfig {
+    /// Measurement periodicity in Hz — the rate of the traffic the node generates to
+    /// measure on; `0` disables generation.
+    pub periodicity_hz: u64,
     /// `--unsolicited=on|off` (default off). When on, the ICMP flood sends
     /// unsolicited echo *replies* instead of echo requests: the peer silently
     /// ignores them at the IP level, so traffic is strictly one-directional —
@@ -578,9 +575,9 @@ pub struct TrafficConfig {
     pub unsolicited: Option<bool>,
 }
 
-impl TrafficConfig {
+impl MeasurementConfig {
     pub fn to_cli_command(&self) -> String {
-        let mut cmd = format!("set-traffic --frequency-hz={}", self.frequency_hz);
+        let mut cmd = format!("set-measurement --periodicity-hz={}", self.periodicity_hz);
         push_on_off(&mut cmd, "unsolicited", self.unsolicited);
         cmd
     }
@@ -740,9 +737,8 @@ fn apply_u32_cache(slot: &mut Option<u32>, value: Option<bool>) {
 
 /// `POST /api/devices/{id}/config/csi-output` — gate off-device delivery of captured CSI.
 ///
-/// This is the runtime delivery gate only. The node's collection mode is a
-/// separate setting, [`WifiConfig::collection`] (`set-wifi --collection=`); the
-/// removed `set-collection-mode` command conflated the two. Capture keeps
+/// This is the runtime delivery gate only. The node's reporting is a
+/// separate setting, [`WifiConfig::reporting`] (`set-wifi --reporting=`). Capture keeps
 /// running with delivery off, so the RX path and its timing are unchanged —
 /// nothing is decoded or logged. An emitter captures nothing, so the gate has
 /// no effect there.
@@ -777,7 +773,7 @@ impl StartConfig {
 
 /// `POST /api/devices/{id}/config/rate` — set the Wi-Fi PHY rate. Reporting
 /// only (it is echoed in `show-config`), except on the ESP-NOW pair
-/// (`esp-now-central` / `esp-now-peripheral`), which applies it.
+/// (`esp-now-initiator` / `esp-now-responder`), which applies it.
 #[derive(Debug, Deserialize)]
 pub struct RateConfig {
     /// e.g. `1m`, `2m`, `5m5`, `11m`, `6m`..`54m`, `mcs0-lgi`..`mcs7-lgi`,
@@ -955,12 +951,12 @@ pub struct DeviceInfo {
 /// different value — or none at all, which means a pre-protocol-2 build —
 /// may silently misinterpret the commands this crate composes, so hosts
 /// should treat a mismatch as "reflash required" rather than degrade.
-pub const SUPPORTED_CLI_PROTOCOL: u32 = 3;
+pub const SUPPORTED_CLI_PROTOCOL: u32 = 4;
 
-/// Oldest CLI protocol this crate still drives. Protocol 3 changed only the serialized CSI format
-/// (esp-csi-rs 0.12's `wire` frames), and [`crate::csi::decode_frame`] decodes both that and the
-/// protocol-2 layouts, so a protocol-2 board is still supported.
-pub const MIN_SUPPORTED_CLI_PROTOCOL: u32 = 2;
+/// Oldest CLI protocol this crate still drives. Protocol 4 renamed the node-configuration grammar
+/// (`--mode=` tokens, `--reporting=`, `set-measurement --periodicity-hz=`) with no aliases, so a
+/// protocol 2 or 3 board would reject the commands this crate composes and must be reflashed.
+pub const MIN_SUPPORTED_CLI_PROTOCOL: u32 = 4;
 
 impl DeviceInfo {
     /// Whether the firmware speaks a CLI protocol this crate drives
@@ -1002,29 +998,36 @@ mod tests {
     use crate::profile::StandardCsiProfile;
 
     #[test]
-    fn traffic_emits_frequency_only_when_unsolicited_omitted() {
-        let cmd = TrafficConfig {
-            frequency_hz: 100,
+    fn measurement_emits_periodicity_only_when_unsolicited_omitted() {
+        let cmd = MeasurementConfig {
+            periodicity_hz: 100,
             unsolicited: None,
         }
         .to_cli_command();
-        assert_eq!(cmd, "set-traffic --frequency-hz=100");
+        assert_eq!(cmd, "set-measurement --periodicity-hz=100");
     }
 
     #[test]
-    fn traffic_emits_unsolicited_flag() {
-        let on = TrafficConfig {
-            frequency_hz: 1000,
+    fn measurement_emits_unsolicited_flag() {
+        let on = MeasurementConfig {
+            periodicity_hz: 1000,
             unsolicited: Some(true),
         }
         .to_cli_command();
-        assert_eq!(on, "set-traffic --frequency-hz=1000 --unsolicited=on");
-        let off = TrafficConfig {
-            frequency_hz: 1000,
+        assert_eq!(on, "set-measurement --periodicity-hz=1000 --unsolicited=on");
+        let off = MeasurementConfig {
+            periodicity_hz: 1000,
             unsolicited: Some(false),
         }
         .to_cli_command();
-        assert_eq!(off, "set-traffic --frequency-hz=1000 --unsolicited=off");
+        assert_eq!(off, "set-measurement --periodicity-hz=1000 --unsolicited=off");
+    }
+
+    #[test]
+    fn measurement_json_uses_periodicity_hz() {
+        let cfg: MeasurementConfig = serde_json::from_str(r#"{"periodicity_hz":50}"#).unwrap();
+        assert_eq!(cfg.periodicity_hz, 50);
+        assert!(serde_json::from_str::<MeasurementConfig>(r#"{"frequency_hz":50}"#).is_err());
     }
 
     fn wifi(mode: &str, peer_mac: Option<&str>, ht40: Option<&str>) -> WifiConfig {
@@ -1041,7 +1044,7 @@ mod tests {
             peer_mac: peer_mac.map(str::to_string),
             ht40: ht40.map(str::to_string),
             emitter_iface: None,
-            collection: None,
+            reporting: None,
             extra: BTreeMap::new(),
         }
     }
@@ -1049,7 +1052,7 @@ mod tests {
     #[test]
     fn wifi_emitter_emits_injection_destination() {
         // `--peer-mac` is the emitter's injection destination (unicast to one
-        // collector); the emitter modes take the operating channel too.
+        // receiver); the emitter modes take the operating channel too.
         let cmd = wifi("ht20-emitter", Some("AA:BB:CC:DD:EE:FF"), None)
             .to_cli_command(None, &StandardCsiProfile)
             .unwrap();
@@ -1154,11 +1157,13 @@ mod tests {
             features: Vec::new(),
         };
         assert!(info(Some(SUPPORTED_CLI_PROTOCOL)).protocol_supported());
-        assert!(info(Some(2)).protocol_supported());
+        assert!(info(Some(4)).protocol_supported());
         // Older and newer grammars are refused: the composed commands
         // may parse differently (or not at all) on either side.
         assert!(!info(Some(1)).protocol_supported());
-        assert!(!info(Some(4)).protocol_supported());
+        assert!(!info(Some(2)).protocol_supported());
+        assert!(!info(Some(3)).protocol_supported());
+        assert!(!info(Some(5)).protocol_supported());
         // No `protocol=` line means pre-protocol-2 firmware.
         assert!(!info(None).protocol_supported());
     }
@@ -1180,7 +1185,7 @@ mod tests {
             peer_mac: None,
             ht40: None,
             emitter_iface: None,
-            collection: None,
+            reporting: None,
             extra: BTreeMap::new(),
         }
         .to_cli_command(None, &StandardCsiProfile)
@@ -1209,7 +1214,7 @@ mod tests {
             peer_mac: None,
             ht40: None,
             emitter_iface: None,
-            collection: None,
+            reporting: None,
             extra: BTreeMap::new(),
         }
         .to_cli_command(Some("esp32c5"), &StandardCsiProfile)
@@ -1232,7 +1237,7 @@ mod tests {
             peer_mac: None,
             ht40: None,
             emitter_iface: None,
-            collection: None,
+            reporting: None,
             extra: BTreeMap::new(),
         }
         .to_cli_command(Some("esp32c5"), &StandardCsiProfile)
@@ -1258,7 +1263,7 @@ mod tests {
             peer_mac: None,
             ht40: None,
             emitter_iface: None,
-            collection: None,
+            reporting: None,
             extra: BTreeMap::new(),
         }
         .to_cli_command(None, &StandardCsiProfile)
@@ -1284,7 +1289,7 @@ mod tests {
             peer_mac: None,
             ht40: None,
             emitter_iface: None,
-            collection: None,
+            reporting: None,
             extra: BTreeMap::new(),
         }
         .to_cli_command(None, &StandardCsiProfile)
@@ -1325,12 +1330,10 @@ mod tests {
                 "wifi-ap",
                 "ht20-emitter",
                 "ht40-emitter",
-                "esp-now-central",
-                "esp-now-peripheral",
-                "esp-now-fast-collector",
-                "esp-now-fast-source",
-                "esp-now-simplex-peer",
+                "esp-now-initiator",
+                "esp-now-responder",
                 "esp-now-simplex-source",
+                "esp-now-simplex-peer",
             ]
         );
         for mode in WIFI_MODES {
@@ -1344,26 +1347,19 @@ mod tests {
     }
 
     #[test]
-    fn wifi_accepts_every_esp_now_mode() {
-        // This test previously asserted the opposite, on the belief that the firmware had dropped
-        // ESP-NOW. It had not: the crate and the CLI shipped those four modes throughout, so this
-        // API was rejecting `set-wifi --mode=` values a user could select on the console.
-        //
-        // Both simplex spellings are accepted. `-fast-` is what the firmware has always taken;
-        // `-simplex-` matches the node model, where the end that floods is the central.
+    fn wifi_rejects_the_retired_mode_tokens() {
+        // Hard cut: the pre-802.11bf spellings are not aliases.
         for mode in [
             "esp-now-central",
             "esp-now-peripheral",
             "esp-now-fast-collector",
             "esp-now-fast-source",
-            "esp-now-simplex-peer",
-            "esp-now-simplex-source",
         ] {
             assert!(
                 wifi(mode, None, None)
                     .to_cli_command(None, &StandardCsiProfile)
-                    .is_ok(),
-                "mode {mode} must be accepted"
+                    .is_err(),
+                "retired mode {mode} must be rejected"
             );
         }
     }
@@ -1371,29 +1367,29 @@ mod tests {
     #[test]
     fn wifi_rejects_unknown_mode() {
         assert!(wifi("mesh", None, None).to_cli_command(None, &StandardCsiProfile).is_err());
-        // "collector" is a collection mode, not an operational mode.
-        assert!(wifi("collector", None, None)
+        // "report" is a reporting value, not a mode.
+        assert!(wifi("report", None, None)
             .to_cli_command(None, &StandardCsiProfile)
             .is_err());
     }
 
     #[test]
-    fn wifi_station_emits_collection() {
+    fn wifi_station_emits_reporting() {
         let mut cfg = wifi("station", None, None);
-        cfg.collection = Some(CollectionMode::Listener);
+        cfg.reporting = Some(Reporting::None);
         let cmd = cfg.to_cli_command(None, &StandardCsiProfile).unwrap();
-        assert_eq!(cmd, "set-wifi --mode=station --collection=listener");
+        assert_eq!(cmd, "set-wifi --mode=station --reporting=none");
     }
 
     #[test]
-    fn wifi_collection_accepted_where_the_mode_admits_a_choice() {
-        for mode in ["station", "wifi-ap", "esp-now-central", "esp-now-peripheral"] {
-            for collection in [CollectionMode::Collector, CollectionMode::Listener] {
+    fn wifi_reporting_accepted_where_the_mode_admits_a_choice() {
+        for mode in ["station", "wifi-ap", "esp-now-initiator", "esp-now-responder"] {
+            for reporting in [Reporting::Report, Reporting::None] {
                 let mut cfg = wifi(mode, None, None);
-                cfg.collection = Some(collection);
+                cfg.reporting = Some(reporting);
                 let cmd = cfg.to_cli_command(None, &StandardCsiProfile).unwrap();
                 assert!(
-                    cmd.ends_with(&format!(" --collection={}", collection.as_str())),
+                    cmd.ends_with(&format!(" --reporting={}", reporting.as_str())),
                     "{cmd}"
                 );
             }
@@ -1401,58 +1397,64 @@ mod tests {
     }
 
     #[test]
-    fn wifi_collection_rejected_where_the_mode_fixes_it() {
+    fn wifi_reporting_rejected_where_the_mode_fixes_it() {
         // The route maps this `Err` to 400.
-        for (mode, fixed) in FIXED_COLLECTION_MODES {
+        for (mode, fixed) in FIXED_REPORTING_MODES {
             assert!(WIFI_MODES.contains(mode), "{mode} is not a base mode");
-            for collection in [CollectionMode::Collector, CollectionMode::Listener] {
+            for reporting in [Reporting::Report, Reporting::None] {
                 let mut cfg = wifi(mode, None, None);
-                cfg.collection = Some(collection);
+                cfg.reporting = Some(reporting);
                 let err = cfg.to_cli_command(None, &StandardCsiProfile).unwrap_err();
                 assert!(err.contains(fixed.as_str()), "{err}");
             }
         }
         let mut sniffer = wifi("sniffer", None, None);
-        sniffer.collection = Some(CollectionMode::Listener);
+        sniffer.reporting = Some(Reporting::None);
         assert_eq!(
             sniffer.to_cli_command(None, &StandardCsiProfile).unwrap_err(),
-            "mode 'sniffer' has a fixed collection mode (collector); omit collection"
+            "mode 'sniffer' has a fixed reporting (report); omit reporting"
         );
     }
 
     #[test]
-    fn wifi_collection_omitted_sends_nothing() {
+    fn wifi_reporting_omitted_sends_nothing() {
         for mode in WIFI_MODES {
             let cmd = wifi(mode, None, None)
                 .to_cli_command(None, &StandardCsiProfile)
                 .unwrap();
-            assert!(!cmd.contains("--collection"), "{cmd}");
+            assert!(!cmd.contains("--reporting"), "{cmd}");
         }
     }
 
     #[test]
-    fn wifi_collection_passes_through_profile_modes() {
-        let mut cfg = wifi("custom-collector", None, None);
-        cfg.collection = Some(CollectionMode::Listener);
+    fn wifi_reporting_passes_through_profile_modes() {
+        let mut cfg = wifi("custom-receiver", None, None);
+        cfg.reporting = Some(Reporting::None);
         let cmd = cfg.to_cli_command(None, &ExtraModeProfile).unwrap();
-        assert!(cmd.ends_with(" --collection=listener"), "{cmd}");
+        assert!(cmd.ends_with(" --reporting=none"), "{cmd}");
     }
 
     #[test]
-    fn wifi_collection_json_is_lowercase_and_optional() {
+    fn wifi_reporting_json_is_lowercase_and_optional() {
         let cfg: WifiConfig =
-            serde_json::from_str(r#"{"mode":"station","collection":"listener"}"#).unwrap();
-        assert_eq!(cfg.collection, Some(CollectionMode::Listener));
+            serde_json::from_str(r#"{"mode":"station","reporting":"none"}"#).unwrap();
+        assert_eq!(cfg.reporting, Some(Reporting::None));
         // Not swallowed by the flattened `extra` map.
         assert!(cfg.extra.is_empty());
         let cfg: WifiConfig = serde_json::from_str(r#"{"mode":"station"}"#).unwrap();
-        assert_eq!(cfg.collection, None);
-        assert!(serde_json::from_str::<WifiConfig>(r#"{"mode":"station","collection":"central"}"#)
+        assert_eq!(cfg.reporting, None);
+        // The retired values are not aliases.
+        for old in ["collector", "listener"] {
+            assert!(serde_json::from_str::<WifiConfig>(&format!(
+                r#"{{"mode":"station","reporting":"{old}"}}"#
+            ))
             .is_err());
+        }
         assert_eq!(
-            serde_json::to_string(&CollectionMode::Collector).unwrap(),
-            r#""collector""#
+            serde_json::to_string(&Reporting::Report).unwrap(),
+            r#""report""#
         );
+        assert_eq!(serde_json::to_string(&Reporting::None).unwrap(), r#""none""#);
     }
 
     /// A profile that names an extra pair of modes, standing in for an out-of-tree capability
@@ -1461,7 +1463,7 @@ mod tests {
     struct ExtraModeProfile;
     impl CsiProfile for ExtraModeProfile {
         fn extra_wifi_modes(&self) -> &'static [&'static str] {
-            &["custom-emitter", "custom-collector"]
+            &["custom-emitter", "custom-receiver"]
         }
     }
 
@@ -1496,10 +1498,9 @@ mod tests {
         assert_eq!(
             err,
             "Unknown wifi mode 'mesh'; expected one of: station, sniffer, \
-             wifi-ap, ht20-emitter, ht40-emitter, esp-now-central, \
-             esp-now-peripheral, esp-now-fast-collector, esp-now-fast-source, \
-             esp-now-simplex-peer, esp-now-simplex-source, custom-emitter, \
-             custom-collector"
+             wifi-ap, ht20-emitter, ht40-emitter, esp-now-initiator, \
+             esp-now-responder, esp-now-simplex-source, esp-now-simplex-peer, \
+             custom-emitter, custom-receiver"
         );
     }
 
@@ -1583,7 +1584,7 @@ mod tests {
     fn csi_output_rejects_the_retired_collection_mode_body() {
         let cfg: CsiOutputConfig = serde_json::from_str(r#"{"enabled":false}"#).unwrap();
         assert!(!cfg.enabled);
-        // `{"mode":"collector"}` was the old body shape. It must fail to
+        // `{"mode":"collector"}` was an old body shape. It must fail to
         // deserialize rather than be silently accepted as some default.
         assert!(serde_json::from_str::<CsiOutputConfig>(r#"{"mode":"collector"}"#).is_err());
         assert!(serde_json::from_str::<CsiOutputConfig>(r#"{"mode":"listener"}"#).is_err());
@@ -1592,7 +1593,7 @@ mod tests {
     #[test]
     fn firmware_defaults_capture_and_deliver() {
         let defaults = DeviceConfig::firmware_defaults();
-        // The default node is a collector on the promiscuous capture path …
+        // The default node reports, on the promiscuous capture path …
         assert_eq!(defaults.wifi.mode.as_deref(), Some("sniffer"));
         assert!(WIFI_MODES.contains(&defaults.wifi.mode.as_deref().unwrap()));
         // … delivering what it captures, with no unicast injection destination.

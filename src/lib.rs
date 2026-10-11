@@ -33,13 +33,14 @@
 //!
 //! # Node modes
 //!
-//! A node is described by four attributes — network role, collection mode, operational mode and
-//! session role — defined once, in the
-//! [network model](https://github.com/csi-rs/esp-csi-rs/blob/main/docs/network-model.md). Through
-//! this API the `mode` of [`WifiConfig`](models::WifiConfig) selects the operational mode (Wi-Fi
-//! station, sniffer or access point, an emitter, or an ESP-NOW or ESP-NOW simplex end) and its
-//! optional `collection` field selects the collection mode where the mode admits a choice; the
-//! host is always the session initiator. Modes this crate does not name are added by an embedder
+//! A node is described by four attributes — mode, session role, sensing role and reporting —
+//! defined once, in the
+//! [network model](https://github.com/csi-rs/esp-csi-rs/blob/main/docs/network-model.md), with
+//! IEEE 802.11bf's vocabulary. Through this API the `mode` of [`WifiConfig`](models::WifiConfig)
+//! selects the mode (Wi-Fi station, sniffer or access point, an emitter, or an ESP-NOW or ESP-NOW
+//! simplex end), from which the session and sensing roles follow, and its optional `reporting`
+//! field selects the reporting where the mode admits a choice. The host only starts and stops
+//! runs; it is never a session initiator. Modes this crate does not name are added by an embedder
 //! through [`CsiProfile`].
 //!
 //! # Routes
@@ -51,8 +52,8 @@
 //! |---|---|
 //! | `GET  …/config` | cached view of the device configuration |
 //! | `POST …/config/reset` | restore firmware defaults |
-//! | `POST …/config/wifi` | operational mode, channel, peer and collection mode (`set-wifi`) |
-//! | `POST …/config/traffic` | traffic generation rate |
+//! | `POST …/config/wifi` | mode, channel, peer and reporting (`set-wifi`) |
+//! | `POST …/config/measurement` | measurement periodicity (`set-measurement`) |
 //! | `POST …/config/csi` | CSI acquisition flags and presets |
 //! | `POST …/config/csi-output` | runtime gate on off-device CSI delivery |
 //! | `POST …/config/output-mode` | host-side sink: `stream`, `dump` or `both` |
