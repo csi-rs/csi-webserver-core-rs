@@ -7,7 +7,7 @@ use crate::{
     models::{
         default_wifi_channel, ApiResponse, CsiConfig, CsiDeliveryConfig, CsiOutputConfig,
         DeviceConfig, IoTasksConfig, OutputMode, OutputModeConfig, ProtocolConfig, RateConfig,
-        TrafficConfig, WifiConfig,
+        MeasurementConfig, WifiConfig,
     },
     routes::Device,
     state::DeviceHandle,
@@ -35,8 +35,8 @@ pub async fn reset_config(Device(dev): Device) -> (StatusCode, Json<ApiResponse>
 // ─── POST /api/devices/{id}/config/wifi ─────────────────────────────────────
 
 /// Forward `set-wifi`. Returns `400` when the body fails validation — among
-/// other cases, when `collection` is sent with a mode whose collection mode is
-/// fixed (see [`FIXED_COLLECTION_MODES`](crate::models::FIXED_COLLECTION_MODES)).
+/// other cases, when `reporting` is sent with a mode whose reporting is
+/// fixed (see [`FIXED_REPORTING_MODES`](crate::models::FIXED_REPORTING_MODES)).
 pub async fn set_wifi(
     Device(dev): Device,
     Json(body): Json<WifiConfig>,
@@ -90,25 +90,26 @@ pub async fn set_wifi(
             // `off` is an alias for `none` on the device side.
             cfg.wifi.ht40 = Some(if ht40 == "off" { "none".to_string() } else { ht40 });
         }
-        if let Some(collection) = body.collection {
-            cfg.wifi.collection = Some(collection);
+        if let Some(reporting) = body.reporting {
+            cfg.wifi.reporting = Some(reporting);
         }
         // sta_password is intentionally not cached.
     }
     result
 }
 
-// ─── POST /api/devices/{id}/config/traffic ──────────────────────────────────
+// ─── POST /api/devices/{id}/config/measurement ──────────────────────────────
 
-pub async fn set_traffic(
+/// Forward `set-measurement` (measurement periodicity and flood kind).
+pub async fn set_measurement(
     Device(dev): Device,
-    Json(body): Json<TrafficConfig>,
+    Json(body): Json<MeasurementConfig>,
 ) -> (StatusCode, Json<ApiResponse>) {
     let cmd = body.to_cli_command();
     let result = send_cmd(&dev, cmd).await;
     if result.0 == StatusCode::OK {
         let mut config = dev.config.lock().await;
-        config.collection.traffic_hz = Some(body.frequency_hz);
+        config.collection.periodicity_hz = Some(body.periodicity_hz);
         // Only overwrite the cached flood kind when the client actually sent
         // the field — an omitted field forwards nothing to the firmware.
         if body.unsolicited.is_some() {
@@ -192,7 +193,7 @@ pub async fn set_output_mode(
 // ─── POST /api/devices/{id}/config/rate ─────────────────────────────────────
 
 /// Set the Wi-Fi PHY rate. Reporting only, except on the ESP-NOW pair
-/// (`esp-now-central` / `esp-now-peripheral`), which applies it.
+/// (`esp-now-initiator` / `esp-now-responder`), which applies it.
 pub async fn set_rate(
     Device(dev): Device,
     Json(body): Json<RateConfig>,

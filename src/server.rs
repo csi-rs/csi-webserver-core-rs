@@ -19,7 +19,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/config", get(routes::config::get_config))
         .route("/config/reset", post(routes::config::reset_config))
         .route("/config/wifi", post(routes::config::set_wifi))
-        .route("/config/traffic", post(routes::config::set_traffic))
+        .route("/config/measurement", post(routes::config::set_measurement))
         .route("/config/csi", post(routes::config::set_csi))
         .route("/config/csi-output", post(routes::config::set_csi_output))
         .route("/config/output-mode", post(routes::config::set_output_mode))
